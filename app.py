@@ -6615,11 +6615,16 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
     if not uploaded_files:
         return
 
+    # Resolver URL de Sheets: session_state → DB → .env (en ese orden)
+    _resolved_url = (sheets_url or
+                     load_app_config("GOOGLE_SHEET_URL", "") or
+                     os.environ.get("GOOGLE_SHEET_URL", "")).strip()
+    _resolved_enabled = sheets_enabled or bool(_resolved_url)
+
     sheets_mgr = None
-    if sheets_enabled and sheets_url:
+    if _resolved_enabled and _resolved_url:
         try:
-            # credentials_path puede ser "" si las credenciales vienen de Streamlit Secrets
-            sheets_mgr = GoogleSheetsManager(sheets_url, creds_path or "")
+            sheets_mgr = GoogleSheetsManager(_resolved_url, creds_path or "")
         except FileNotFoundError as e:
             _st.error(f"❌ {e}")
         except Exception as e:
