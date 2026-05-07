@@ -756,6 +756,248 @@ def load_app_config(key: str, default: str = "") -> str:
     return default
 
 
+# ── Backup de bases de datos ──────────────────────────────────
+
+def create_db_backup() -> bytes:
+    """
+    Crea un backup ZIP de ambas bases de datos SQLite usando la API online de SQLite.
+    Devuelve bytes del ZIP descargable.
+    Thread-safe: usa la API de backup de SQLite que no bloquea lecturas.
+    """
+    import io, zipfile, sqlite3 as _sq3
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for label, path in [
+            ("clinical_extractor_main.db",     DB_PATH),
+            ("clinical_extractor_security.db", DB_PATH_SEC),
+        ]:
+            if not Path(path).exists():
+                continue
+            try:
+                # Usar la API de backup de SQLite — no bloquea escrituras activas
+                db_buf = io.BytesIO()
+                src = _sq3.connect(str(path), check_same_thread=False)
+                dst = _sq3.connect(":memory:")
+                src.backup(dst)
+                src.close()
+                # Serializar la copia en memoria
+                with _sq3.connect(str(path) + "_backup_tmp") as _tmp:
+                    dst.backup(_tmp)
+                dst.close()
+                tmp_path = Path(str(path) + "_backup_tmp")
+                if tmp_path.exists():
+                    zf.write(str(tmp_path), label)
+                    tmp_path.unlink()
+            except Exception as e:
+                log.warning(f"Backup {label}: {e}")
+                # Fallback: copia directa del archivo
+                try:
+                    zf.write(str(path), label)
+                except Exception:
+                    pass
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def backup_to_drive(folder_id: str = "") -> dict:
+    """
+    Sube el backup ZIP a Google Drive.
+    Si folder_id está vacío, usa gdrive_backup_folder guardado en DB.
+    Mantiene solo los últimos 7 backups en la carpeta (borra los más antiguos).
+    Devuelve {"ok": bool, "url": str, "filename": str, "message": str}.
+    """
+    _folder_id = (folder_id or
+                  load_app_config("gdrive_backup_folder_id", "") or
+                  GoogleDriveManager._extract_folder_id(
+                      load_app_config("gdrive_backup_folder_url", "")
+                  ))
+    if not _folder_id:
+        return {"ok": False, "url": "", "filename": "",
+                "message": "No hay carpeta de backup configurada en Drive."}
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        import io as _io
+
+        _mgr = GoogleDriveManager(_folder_id)
+        _zip  = create_db_backup()
+        _ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        _name = f"cep_backup_{_ts}.zip"
+
+        # Subir usando el servicio de Drive ya autenticado
+        _meta = {
+            "name":    _name,
+            "mimeType": "application/zip",
+            "parents": [_folder_id],
+        }
+        _media = MediaIoBaseUpload(
+            _io.BytesIO(_zip),
+            mimetype="application/zip",
+            resumable=True,
+        )
+        _file = _mgr.service.files().create(
+            body=_meta, media_body=_media, fields="id,webViewLink"
+        ).execute()
+        _url = _file.get("webViewLink", "")
+
+        # Mantener solo los últimos 7 backups — borrar los más antiguos
+        try:
+            _all = _mgr.service.files().list(
+                q=f"'{_folder_id}' in parents and name contains 'cep_backup_' "
+                  f"and trashed=false",
+                orderBy="name desc",
+                fields="files(id,name)",
+                pageSize=50,
+            ).execute().get("files", [])
+            for _old in _all[7:]:
+                try:
+                    _mgr.service.files().delete(fileId=_old["id"]).execute()
+                    log.info(f"Backup antiguo eliminado: {_old['name']}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        log.info(f"✅ Backup automático subido a Drive: {_name}")
+        save_app_config("gdrive_last_backup", datetime.utcnow().isoformat(),
+                        updated_by="auto_backup")
+        return {"ok": True, "url": _url, "filename": _name,
+                "message": f"Backup subido: {_name}"}
+
+    except Exception as e:
+        log.error(f"❌ Error backup Drive: {e}")
+        return {"ok": False, "url": "", "filename": "",
+                "message": f"Error: {e}"}
+
+
+def auto_restore_from_drive() -> dict:
+    """
+    Se ejecuta al arrancar la app. Detecta si las DBs están vacías o ausentes
+    y las restaura automáticamente desde el backup más reciente en Google Drive.
+
+    Devuelve:
+      {"status": "ok"|"restored"|"skipped"|"error"|"no_config",
+       "message": str}
+    """
+    import io as _io, zipfile as _zf
+
+    # ── Verificar si las DBs tienen datos ────────────────────────────────
+    _db_ok = True
+    try:
+        _con = _sec_db()
+        _user_count = _con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if _user_count == 0:
+            _db_ok = False
+    except Exception:
+        _db_ok = False
+
+    if _db_ok:
+        return {"status": "ok", "message": "DBs intactas, no se necesita restaurar."}
+
+    log.warning("⚠️ DB vacía o ausente al arrancar — buscando backup en Drive...")
+
+    # ── Verificar configuración de Drive ─────────────────────────────────
+    _folder_url = load_app_config("gdrive_backup_folder_url", "")
+    _folder_id  = (load_app_config("gdrive_backup_folder_id", "") or
+                   GoogleDriveManager._extract_folder_id(_folder_url))
+    _gcp_creds  = load_app_config("gcp_credentials_json", "")
+
+    # Si no hay credenciales en DB, intentar Streamlit Secrets
+    if not _gcp_creds:
+        try:
+            import streamlit as _st_r
+            if "gcp_service_account" in _st_r.secrets:
+                import json as _jj
+                _gcp_creds = _jj.dumps(dict(_st_r.secrets["gcp_service_account"]))
+        except Exception:
+            pass
+
+    if not _folder_id or not _gcp_creds:
+        log.warning("No hay configuración de backup Drive — no se puede auto-restaurar.")
+        return {
+            "status": "no_config",
+            "message": (
+                "La base de datos está vacía y no hay configuración de backup en Drive. "
+                "Ve a 👑 Admin → 💾 Backup para restaurar manualmente."
+            )
+        }
+
+    # ── Buscar el backup más reciente en Drive ────────────────────────────
+    try:
+        _gd = GoogleDriveManager(_folder_id)
+        _files = _gd.service.files().list(
+            q=f"'{_folder_id}' in parents and name contains 'cep_backup_' "
+              f"and trashed=false",
+            orderBy="name desc",
+            fields="files(id,name,modifiedTime)",
+            pageSize=5,
+        ).execute().get("files", [])
+
+        if not _files:
+            return {
+                "status": "no_config",
+                "message": "No se encontraron backups en la carpeta de Drive configurada."
+            }
+
+        _latest = _files[0]
+        log.info(f"Restaurando desde: {_latest['name']}")
+
+        # ── Descargar y restaurar ─────────────────────────────────────────
+        _zip_bytes = _gd.download_file(_latest["id"])
+
+        with _zf.ZipFile(_io.BytesIO(_zip_bytes)) as _z:
+            _restored = []
+            for _n in _z.namelist():
+                if "main" in _n and str(DB_PATH).endswith(".db"):
+                    Path(str(DB_PATH)).write_bytes(_z.read(_n))
+                    _restored.append("DB principal")
+                    log.info(f"✅ DB principal restaurada desde {_n}")
+                elif "security" in _n:
+                    Path(str(DB_PATH_SEC)).write_bytes(_z.read(_n))
+                    _restored.append("DB seguridad")
+                    log.info(f"✅ DB seguridad restaurada desde {_n}")
+
+        if _restored:
+            log.info(f"✅ Auto-restauración completada: {', '.join(_restored)}")
+            return {
+                "status": "restored",
+                "message": (
+                    f"Base de datos restaurada automáticamente desde "
+                    f"**{_latest['name']}** ({', '.join(_restored)}). "
+                    f"La app está lista."
+                )
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"El ZIP {_latest['name']} no contenía archivos de DB reconocibles."
+            }
+
+    except Exception as e:
+        log.error(f"❌ Error en auto-restauración: {e}")
+        return {
+            "status": "error",
+            "message": (
+                f"Error al restaurar desde Drive: {e}. "
+                "Ve a 👑 Admin → 💾 Backup para restaurar manualmente."
+            )
+        }
+
+
+def get_db_stats() -> dict:
+    """Retorna estadísticas básicas de ambas DBs para mostrar en la UI."""
+    stats = {}
+    for label, path in [("main", DB_PATH), ("security", DB_PATH_SEC)]:
+        p = Path(path)
+        if p.exists():
+            size_kb = p.stat().st_size // 1024
+            stats[label] = {"path": str(p.name), "size_kb": size_kb}
+        else:
+            stats[label] = {"path": str(p.name), "size_kb": 0}
+    return stats
+
+
 # ── Hash de contraseña (bcrypt con cost factor 12) ──────────────
 
 def hash_password(password: str) -> str:
@@ -6732,30 +6974,14 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
     if _resolved_enabled and _resolved_url:
         try:
             sheets_mgr = GoogleSheetsManager(_resolved_url, creds_path or "")
-            # Prueba inmediata de escritura para confirmar acceso
-            try:
-                _test_ws = sheets_mgr.ws_data
-                _test_ws.append_row(
-                    ["TEST_CONEXION", datetime.utcnow().isoformat(),
-                     "ok", "", "", "", "", ""],
-                    value_input_option="USER_ENTERED"
-                )
-                # Borrar la fila de prueba
-                _last = len(_test_ws.get_all_values())
-                if _last > 0:
-                    _test_ws.delete_rows(_last)
-                _st.success("✅ Google Sheets conectado y con acceso de escritura")
-            except Exception as _we:
-                _st.error("❌ Sheets conectado pero sin permiso de ESCRITURA: " + str(_we) +
-                          ". Asegúrate de que " +
-                          (sheets_mgr.spreadsheet.client.auth.service_account_email
-                           if hasattr(sheets_mgr, 'spreadsheet') else "la cuenta de servicio") +
-                          " tiene rol Editor (no Lector).")
-                sheets_mgr = None
+            log.info(f"✅ Sheets conectado para extracción: {sheets_mgr.spreadsheet.title}")
         except Exception as e:
-            _st.warning("Sheets no conectado (la extraccion continua): " + str(e))
+            _st.warning("Sheets no conectado (la extracción continúa sin sincronizar): " + str(e))
     enable_anon     = _st.session_state.get("cfg_anon_v",     False)
     enable_ensemble = _st.session_state.get("cfg_ensemble_v", True)
+
+    # Garantizar que campos_sel nunca esté vacío — usar todos los campos por defecto
+    _campos_final = campos_sel or CAMPOS_DEFAULT
 
     extractor = ClinicalExtractor(
         api_key=api_key,
@@ -6764,7 +6990,7 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
         max_tokens=max_tokens,
         ocr_lang=ocr_lang,
         ocr_dpi=ocr_dpi,
-        campos=campos_sel,
+        campos=_campos_final,
         confidence_threshold=confidence_threshold,
         use_easyocr=use_easyocr,
         use_vision_ocr=use_vision_ocr,
@@ -6780,6 +7006,13 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
         sheets_manager=sheets_mgr,
         max_workers=max_workers,
     )
+
+    # Informar al usuario qué está conectado
+    _status_parts = []
+    if sheets_mgr:
+        _status_parts.append(f"📊 Sheets: **{sheets_mgr.spreadsheet.title}**")
+    if _status_parts:
+        _st.caption("Sincronizando con: " + " · ".join(_status_parts))
 
     files_to_process = []
     dup_log = _st.session_state.get("duplicate_log", [])
@@ -6852,6 +7085,21 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
     elif sheets_mgr and done == 0:
         _msg += " (sin resultados exitosos para enviar a Sheets)"
     _st.success(_msg)
+
+    # Auto-backup a Drive si está configurado y hubo extracciones exitosas
+    if done > 0:
+        _backup_folder = (load_app_config("gdrive_backup_folder_id", "") or
+                          load_app_config("gdrive_backup_folder_url", ""))
+        _auto_backup   = load_app_config("gdrive_auto_backup", "") == "1"
+        if _backup_folder and _auto_backup:
+            try:
+                _br = backup_to_drive()
+                if _br["ok"]:
+                    _st.caption(f"☁️ Backup automático subido a Drive: {_br['filename']}")
+                else:
+                    log.warning(f"Auto-backup falló: {_br['message']}")
+            except Exception as _abe:
+                log.warning(f"Auto-backup error: {_abe}")
 
 
 def _page_upload(st, user_payload, api_key, provider, model, max_tokens,
@@ -7107,7 +7355,43 @@ def _page_results(st, results, campos_sel, user_payload):
                 mime="application/json", use_container_width=True,
             )
 
-        # Fila 2 de exportación — Excel y búsqueda
+        # Fila 2 — Sincronizar a Sheets manualmente
+        _sh_url_r = (load_app_config("GOOGLE_SHEET_URL","") or
+                     os.environ.get("GOOGLE_SHEET_URL",""))
+        if _sh_url_r:
+            _done_filtered = [r for r in filtered if r.get("_status") == "done"]
+            if st.button(
+                f"📊 Sincronizar {len(_done_filtered)} resultado(s) a Google Sheets",
+                key="btn_sync_sheets",
+                disabled=len(_done_filtered) == 0,
+                help="Escribe todos los resultados visibles en la hoja 'Extracciones' de Google Sheets."
+            ):
+                with st.spinner("Conectando y sincronizando..."):
+                    try:
+                        _smgr = GoogleSheetsManager(_sh_url_r, "")
+                        _campos_sync = campos_sel or CAMPOS_DEFAULT
+                        for _r in _done_filtered:
+                            _smgr.buffer_extraction(
+                                data={k: v for k, v in _r.items()
+                                      if not k.startswith("_") or
+                                      k in ("_filename","_source","_status",
+                                            "_file_hash","_project_id")},
+                                campos=_campos_sync,
+                                validation=_r.get("_validation", {}),
+                                alerts=_r.get("_alerts", []),
+                                confidence=_r.get("_confidence", 0.0),
+                                needs_review=_r.get("_needs_review", False),
+                            )
+                        _smgr.flush_batch()
+                        st.success(
+                            f"✅ {len(_done_filtered)} resultado(s) sincronizados a Sheets: "
+                            f"**{_smgr.spreadsheet.title}**"
+                        )
+                    except Exception as _se:
+                        st.error(f"❌ Error sincronizando a Sheets: {_se}")
+        st.markdown("")
+
+        # Fila 3 — Excel y búsqueda
         ex_c1, ex_c2 = st.columns(2)
         with ex_c1:
             if st.button("📥 Preparar Excel (.xlsx)", key="prep_xlsx"):
@@ -8296,11 +8580,15 @@ def _page_settings(st, user_payload):
 
         if _cfg_to_save:
             try:
+                # Guardar en .env (servidor propio)
                 _persist_config(_cfg_to_save, overwrite=True)
+                # Guardar TAMBIÉN en DB cifrada (Streamlit Cloud / cualquier entorno)
+                _uid = user_payload.get("sub", "admin")
+                for _k, _v in _cfg_to_save.items():
+                    save_app_config(_k, _v, updated_by=_uid)
                 st.success(
-                    f"✅ Configuración guardada en `{_CFG_FILE}` "
-                    f"({len(_cfg_to_save)} parámetros). "
-                    "Estará disponible automáticamente al reiniciar."
+                    f"✅ {len(_cfg_to_save)} parámetros guardados en DB cifrada y en archivo .env. "
+                    "La configuración persiste entre reinicios automáticamente."
                 )
             except Exception as _e:
                 st.error(f"❌ No se pudo guardar: {_e}")
@@ -8525,8 +8813,8 @@ def _page_queue(st, user_payload, user_id):
 
 def _page_admin(st, user_payload):
     """Página: gestión de usuarios y seguridad."""
-    tab_users, tab_sessions, tab_audit, tab_pass = st.tabs([
-        "Usuarios", "Sesiones activas", "Audit log", "Mi contraseña"
+    tab_users, tab_sessions, tab_audit, tab_pass, tab_backup = st.tabs([
+        "Usuarios", "Sesiones activas", "Audit log", "Mi contraseña", "💾 Backup"
     ])
 
     with tab_users:
@@ -8619,6 +8907,162 @@ def _page_admin(st, user_payload):
                         if k.startswith("_"): del st.session_state[k]
                     st.rerun()
                 else: st.error(f"❌ {msg}")
+
+    with tab_backup:
+        st.markdown("### 💾 Backup de bases de datos")
+
+        # ── Estadísticas ──────────────────────────────────────────────────
+        try:
+            _stats = get_db_stats()
+            bc1, bc2, bc3 = st.columns(3)
+            bc1.metric("DB Principal", f"{_stats['main']['size_kb']:,} KB",
+                       help=_stats['main']['path'])
+            bc2.metric("DB Seguridad", f"{_stats['security']['size_kb']:,} KB",
+                       help=_stats['security']['path'])
+            _last_bk = load_app_config("gdrive_last_backup", "")
+            bc3.metric("Último backup", _last_bk[:10] if _last_bk else "Nunca")
+        except Exception as _se:
+            st.caption(f"Estadísticas no disponibles: {_se}")
+
+        st.markdown("---")
+
+        # ── Backup manual ─────────────────────────────────────────────────
+        st.markdown("**Backup manual**")
+        col_gen, col_drive = st.columns(2)
+
+        with col_gen:
+            if st.button("🗜️ Generar ZIP", key="btn_gen_backup", type="primary",
+                         use_container_width=True):
+                with st.spinner("Creando backup..."):
+                    try:
+                        _zip_bytes = create_db_backup()
+                        st.session_state["_backup_zip"] = _zip_bytes
+                        st.success(f"✅ {len(_zip_bytes)//1024:,} KB listos")
+                    except Exception as _be:
+                        st.error(f"❌ {_be}")
+            if st.session_state.get("_backup_zip"):
+                _fname = f"cep_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                st.download_button(
+                    "⬇️ Descargar ZIP",
+                    data=st.session_state["_backup_zip"],
+                    file_name=_fname,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+
+        with col_drive:
+            _has_gcp = bool(load_app_config("gcp_credentials_json",""))
+            _bk_url  = load_app_config("gdrive_backup_folder_url","")
+            if not _has_gcp:
+                st.warning("Configura las credenciales de Google primero.")
+            else:
+                if st.button("☁️ Subir a Drive ahora", key="btn_backup_drive",
+                             use_container_width=True,
+                             disabled=not _bk_url):
+                    with st.spinner("Subiendo a Drive..."):
+                        _br = backup_to_drive()
+                        if _br["ok"]:
+                            st.success(f"✅ {_br['filename']}")
+                            if _br["url"]:
+                                st.markdown(f"[Abrir en Drive]({_br['url']})")
+                        else:
+                            st.error(_br["message"])
+                if not _bk_url:
+                    st.caption("Configura la carpeta de backup abajo primero.")
+
+        st.markdown("---")
+
+        # ── Configuración de backup automático ───────────────────────────
+        st.markdown("**Backup automático en Google Drive**")
+        st.caption(
+            "Cuando está activo, sube un backup ZIP a Drive automáticamente "
+            "cada vez que termina una extracción exitosa. "
+            "Guarda los últimos 7 backups y borra los más antiguos."
+        )
+
+        _bk_url_cur  = load_app_config("gdrive_backup_folder_url","")
+        _auto_cur    = load_app_config("gdrive_auto_backup","") == "1"
+
+        _bk_url_inp = st.text_input(
+            "URL de la carpeta de Drive para backups",
+            value=_bk_url_cur,
+            placeholder="https://drive.google.com/drive/folders/...",
+            key="cfg_bk_folder",
+            help="Crea una carpeta en Drive llamada 'CEP_Backups' y pega su URL aquí."
+        )
+        _auto_inp = st.checkbox(
+            "Activar backup automático después de cada extracción",
+            value=_auto_cur,
+            key="cfg_bk_auto"
+        )
+
+        if st.button("💾 Guardar configuración de backup", key="btn_save_bk",
+                     type="primary"):
+            try:
+                _uid = user_payload.get("sub","admin")
+                save_app_config("gdrive_backup_folder_url",
+                                _bk_url_inp.strip(), updated_by=_uid)
+                save_app_config("gdrive_backup_folder_id",
+                                GoogleDriveManager._extract_folder_id(_bk_url_inp.strip()),
+                                updated_by=_uid)
+                save_app_config("gdrive_auto_backup",
+                                "1" if _auto_inp else "0", updated_by=_uid)
+                st.success("✅ Configuración de backup guardada.")
+                if _auto_inp:
+                    st.info(
+                        "Backup automático activo. Se subirá a Drive después de "
+                        "cada extracción exitosa. Los últimos 7 backups se conservan."
+                    )
+            except Exception as _e:
+                st.error(f"❌ {_e}")
+
+        st.markdown("---")
+
+        # ── Restaurar backup ─────────────────────────────────────────────
+        with st.expander("🔄 Restaurar desde backup", expanded=False):
+            st.warning(
+                "⚠️ Restaurar **reemplaza** las bases de datos actuales. "
+                "Todos los datos actuales se perderán. "
+                "Haz un backup del estado actual antes de restaurar."
+            )
+            _restore_file = st.file_uploader(
+                "Sube el archivo ZIP de backup",
+                type=["zip"],
+                key="restore_zip"
+            )
+            _confirm_restore = st.text_input(
+                "Escribe RESTAURAR para confirmar",
+                key="restore_confirm"
+            )
+            if st.button("🔄 Ejecutar restauración", key="btn_restore",
+                         type="primary",
+                         disabled=not _restore_file or _confirm_restore != "RESTAURAR"):
+                if _restore_file and _confirm_restore == "RESTAURAR":
+                    import zipfile as _zf, io as _io
+                    with st.spinner("Restaurando..."):
+                        try:
+                            _zdata = _restore_file.read()
+                            with _zf.ZipFile(_io.BytesIO(_zdata)) as _z:
+                                _names = _z.namelist()
+                                for _n in _names:
+                                    if "main" in _n:
+                                        Path(str(DB_PATH)).write_bytes(_z.read(_n))
+                                        st.success(f"✅ DB principal restaurada desde {_n}")
+                                    elif "security" in _n:
+                                        Path(str(DB_PATH_SEC)).write_bytes(_z.read(_n))
+                                        st.success(f"✅ DB seguridad restaurada desde {_n}")
+                            st.warning(
+                                "Restauración completada. "
+                                "La aplicación necesita reiniciarse para usar los datos restaurados. "
+                                "Cierra sesión y vuelve a entrar."
+                            )
+                        except Exception as _re:
+                            st.error(f"❌ Error restaurando: {_re}")
+
+        st.caption(
+            f"DB principal: `{DB_PATH.name}`  |  "
+            f"DB seguridad: `{DB_PATH_SEC.name}`"
+        )
 
 
 def _render_force_change_password(st, user_payload: Dict, user_id: str, token: str):
@@ -9575,14 +10019,42 @@ def run_streamlit():
     .stExpander {border:0.5px solid var(--color-border-tertiary)!important}
     </style>""", unsafe_allow_html=True)
 
-    # MEJORA v15-CLINIC: init_db solo una vez por proceso del servidor
+    # ── Arranque: init DB + auto-restauración si está vacía ─────────────────
     if "db_initialized" not in st.session_state:
+
+        # 1. Intentar auto-restauración ANTES de init_db
+        #    (si la DB está vacía o ausente, la restauramos desde Drive)
+        if not st.session_state.get("_restore_attempted"):
+            st.session_state["_restore_attempted"] = True
+            try:
+                _restore_result = auto_restore_from_drive()
+                _rs = _restore_result.get("status")
+                if _rs == "restored":
+                    st.session_state["_restore_msg"] = ("success", _restore_result["message"])
+                elif _rs in ("no_config", "skipped"):
+                    pass  # Normal — no hay backup configurado todavía
+                elif _rs == "error":
+                    st.session_state["_restore_msg"] = ("warning", _restore_result["message"])
+            except Exception as _re:
+                log.warning(f"Auto-restore error al arrancar: {_re}")
+
+        # 2. Inicializar/crear tablas (seguro aunque se acabe de restaurar)
         init_db()
         st.session_state["db_initialized"] = True
-        # Verificar dependencias del sistema y mostrar advertencias
+
+        # 3. Verificar dependencias del sistema
         sys_warns = _check_system_deps()
         if sys_warns:
             st.session_state["_sys_warnings"] = sys_warns
+
+    # Mostrar resultado de la restauración si ocurrió
+    if st.session_state.get("_restore_msg"):
+        _rmsg_type, _rmsg_text = st.session_state.pop("_restore_msg")
+        if _rmsg_type == "success":
+            st.success(f"🔄 {_rmsg_text}")
+        elif _rmsg_type == "warning":
+            st.warning(f"⚠️ {_rmsg_text}")
+
     if st.session_state.get("_sys_warnings"):
         for w in st.session_state["_sys_warnings"]:
             st.warning(w)
@@ -9655,32 +10127,62 @@ def run_streamlit():
     # Navegación lateral
     page = _sidebar_nav(st, st.session_state["_page"], user_role, results)
 
-    # Leer config guardada en session_state
-    def cfg(k, default):
-        return st.session_state.get(k, default)
+    # Leer config: session_state → DB cifrada → .env → default hardcodeado
+    # Esto garantiza que la configuración persiste aunque el usuario no visite Configuración
+    def cfg(k, default, db_key=None):
+        """Lee de session_state; si está vacío, lee de DB cifrada como fallback."""
+        val = st.session_state.get(k)
+        if val is not None and val != "":
+            return val
+        if db_key:
+            db_val = load_app_config(db_key, "")
+            if db_val:
+                # Cachear en session_state para no consultar DB en cada rerender
+                st.session_state[k] = db_val
+                return db_val
+        return default
 
-    api_key              = cfg("cfg_api_key",    os.environ.get("ANTHROPIC_API_KEY",""))
-    provider             = cfg("cfg_prov",        "claude")
-    model                = cfg("cfg_mdl",         "claude-sonnet-4-6")
-    max_tokens           = cfg("cfg_max_tok",     3000)
-    confidence_threshold = cfg("cfg_conf_thr",    0.75)
-    ocr_lang             = cfg("cfg_lang_ocr",    "spa+eng")
-    ocr_dpi              = cfg("cfg_dpi_ocr",     300)
-    use_easyocr          = cfg("cfg_easyocr_v",   False)
-    use_vision_ocr       = cfg("cfg_vision_v",    False)
-    campos_sel           = cfg("cfg_campos_v",    PLANTILLAS_CONSULTA["General / Base"])
-    tipo_consulta        = cfg("cfg_tipo_v",      "General / Base")
-    sheets_enabled       = cfg("cfg_sheets_en",   False)
-    # Fallback: si session_state está vacío (sesión nueva), leer desde DB/.env
-    sheets_url = (cfg("cfg_sheets_url", "") or
-                  load_app_config("GOOGLE_SHEET_URL", "") or
-                  os.environ.get("GOOGLE_SHEET_URL", ""))
-    # sheets_enabled: activar automáticamente si hay URL guardada
+    def cfg_num(k, default, db_key=None):
+        """cfg() para valores numéricos."""
+        try:
+            return type(default)(cfg(k, default, db_key))
+        except (ValueError, TypeError):
+            return default
+
+    def cfg_bool(k, default, db_key=None):
+        """cfg() para valores booleanos."""
+        v = cfg(k, default, db_key)
+        if isinstance(v, bool):
+            return v
+        return str(v).strip() in ("1", "true", "True", "yes")
+
+    _db_provider = load_app_config("CEP_PROVIDER", "")
+    _db_api_key  = (load_app_config("ANTHROPIC_API_KEY", "") or
+                    load_app_config("OPENAI_API_KEY", "") or
+                    os.environ.get("ANTHROPIC_API_KEY", "") or
+                    os.environ.get("OPENAI_API_KEY", ""))
+
+    provider    = cfg("cfg_prov",    _db_provider or "claude",     "CEP_PROVIDER")
+    api_key     = cfg("cfg_api_key", _db_api_key,
+                      "ANTHROPIC_API_KEY" if provider == "claude" else "OPENAI_API_KEY")
+    model       = cfg("cfg_mdl",     load_app_config("CEP_MODEL","") or "claude-sonnet-4-6",
+                      "CEP_MODEL")
+    max_tokens           = cfg_num("cfg_max_tok",  3000,  "CEP_MAX_TOKENS")
+    confidence_threshold = cfg_num("cfg_conf_thr", 0.75,  "CEP_CONF_THR")
+    ocr_lang    = cfg("cfg_lang_ocr", load_app_config("CEP_OCR_LANG","") or "spa+eng", "CEP_OCR_LANG")
+    ocr_dpi     = cfg_num("cfg_dpi_ocr",  300,   "CEP_OCR_DPI")
+    use_easyocr    = cfg_bool("cfg_easyocr_v", False)
+    use_vision_ocr = cfg_bool("cfg_vision_v",  False)
+    campos_sel  = cfg("cfg_campos_v", PLANTILLAS_CONSULTA["General / Base"])
+    tipo_consulta = cfg("cfg_tipo_v", "General / Base")
+    sheets_url  = (cfg("cfg_sheets_url", "", "GOOGLE_SHEET_URL") or
+                   os.environ.get("GOOGLE_SHEET_URL", ""))
+    sheets_enabled = cfg_bool("cfg_sheets_en", bool(sheets_url))
     if sheets_url and not sheets_enabled:
         sheets_enabled = True
-    creds_path           = cfg("cfg_creds_path",  "")
-    max_workers          = cfg("cfg_max_wrk",     2)
-    sf_enabled           = cfg("cfg_sf_en",       False)
+    creds_path  = cfg("cfg_creds_path", "")
+    max_workers = cfg_num("cfg_max_wrk", 2, "CEP_MAX_WORKERS")
+    sf_enabled  = cfg_bool("cfg_sf_en", False)
 
     # Enrutar a la página activa
     if page == "dashboard":
