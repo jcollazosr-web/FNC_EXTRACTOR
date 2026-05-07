@@ -3425,70 +3425,61 @@ class GoogleSheetsManager:
         return result
 
     def _connect(self):
+        import gspread
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build as _build
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+
+        # ── 1. Cargar credenciales ────────────────────────────────────────
+        cred_data = self._load_credentials_data(self.credentials_path)
+        service_account_email = cred_data.get("client_email", "")
+        creds = Credentials.from_service_account_info(cred_data, scopes=scopes)
+
+        # ── 2. Conectar gspread (método más directo y compatible) ─────────
+        # service_account_from_dict funciona en gspread 5.x y 6.x
+        self.gc = gspread.service_account_from_dict(cred_data)
+
+        # ── 3. Extraer ID del spreadsheet ─────────────────────────────────
+        sheet_id = self._extract_sheet_id(self.spreadsheet_url)
+
+        # ── 4. Auto-compartir usando Drive API ────────────────────────────
+        if service_account_email:
+            try:
+                drive_svc = _build("drive", "v3", credentials=creds,
+                                   cache_discovery=False)
+                self._auto_share_sheet(drive_svc, sheet_id, service_account_email)
+            except Exception as _e:
+                log.warning(f"Auto-share omitido: {_e}")
+
+        # ── 5. Abrir el spreadsheet ───────────────────────────────────────
         try:
-            from google.oauth2.service_account import Credentials
-            from googleapiclient.discovery import build as _build
-            import gspread
-
-            scopes = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ]
-
-            cred_data = self._load_credentials_data(self.credentials_path)
-
-            # ── Autenticar con gspread (compatible gspread 5.x y 6.x) ────
-            creds = Credentials.from_service_account_info(cred_data, scopes=scopes)
-            try:
-                # gspread >= 6.0: usar Client directamente
-                self.gc = gspread.Client(auth=creds)
-                self.gc.session  # fuerza inicialización
-            except Exception:
-                try:
-                    # gspread 5.x: authorize()
-                    self.gc = gspread.authorize(creds)
-                except Exception:
-                    # Último recurso: service_account_from_dict
-                    self.gc = gspread.service_account_from_dict(cred_data)
-
-            # ── Extraer el ID del spreadsheet ────────────────────────────
-            sheet_id = self._extract_sheet_id(self.spreadsheet_url)
-
-            # ── Auto-compartir con la cuenta de servicio ─────────────────
-            service_account_email = cred_data.get("client_email", "")
-            if service_account_email:
-                try:
-                    drive_svc = _build("drive", "v3", credentials=creds)
-                    self._auto_share_sheet(drive_svc, sheet_id, service_account_email)
-                except Exception as _e:
-                    log.warning(f"Auto-share omitido: {_e}")
-
-            # ── Abrir el spreadsheet ──────────────────────────────────────
-            try:
-                self.spreadsheet = self.gc.open_by_key(sheet_id)
-            except gspread.exceptions.APIError as api_err:
-                # Error 403: el sheet no está compartido todavía (auto-share puede haber fallado)
-                if "403" in str(api_err) or "PERMISSION_DENIED" in str(api_err):
-                    raise PermissionError(
-                        f"Sin acceso al spreadsheet. Compártelo manualmente con: "
-                        f"{service_account_email} (rol Editor)."
-                    ) from api_err
-                raise
-            except Exception:
-                self.spreadsheet = self.gc.open_by_url(self.spreadsheet_url)
-
-            self.ws_data    = self._get_or_create_sheet("Extracciones")
-            self.ws_review  = self._get_or_create_sheet("Revisar_Manual")
-            self.ws_alerts  = self._get_or_create_sheet("Alertas_Medicas")
-            self.ws_quality = self._get_or_create_sheet("Calidad_Campos")
-
-            log.info(f"✅ Google Sheets conectado: {self.spreadsheet.title}")
-
-        except (FileNotFoundError, PermissionError):
+            self.spreadsheet = self.gc.open_by_key(sheet_id)
+        except gspread.exceptions.APIError as api_err:
+            err_str = str(api_err)
+            if "403" in err_str or "PERMISSION_DENIED" in err_str:
+                raise PermissionError(
+                    f"Sin acceso al spreadsheet. "
+                    f"Compártelo manualmente con: {service_account_email} (rol Editor)."
+                ) from api_err
+            elif "404" in err_str:
+                raise ValueError(
+                    "Spreadsheet no encontrado. Verifica que la URL sea correcta."
+                ) from api_err
             raise
-        except Exception as e:
-            log.error(f"❌ Error Google Sheets: {e}")
-            raise
+        except Exception as _e2:
+            raise RuntimeError(f"No se pudo abrir el spreadsheet: {_e2}") from _e2
+
+        # ── 6. Crear/obtener hojas ────────────────────────────────────────
+        self.ws_data    = self._get_or_create_sheet("Extracciones")
+        self.ws_review  = self._get_or_create_sheet("Revisar_Manual")
+        self.ws_alerts  = self._get_or_create_sheet("Alertas_Medicas")
+        self.ws_quality = self._get_or_create_sheet("Calidad_Campos")
+
+        log.info(f"✅ Google Sheets conectado: {self.spreadsheet.title}")
  
     def _get_or_create_sheet(self, name: str):
         try:
@@ -7511,6 +7502,34 @@ def _page_settings(st, user_payload):
                     st.warning("⚠️ No hay credenciales de Google configuradas. "
                                "Contacta al administrador.")
                 st.caption("🔒 Solo el administrador puede modificar las credenciales.")
+
+            # ── Botón de diagnóstico ─────────────────────────────────────
+            if not _ro and (_has_db or _has_secrets or _has_session):
+                if st.button("🔍 Diagnóstico de credenciales", key="btn_diag_sheets"):
+                    try:
+                        import gspread as _gsp
+                        st.write(f"**gspread version:** {_gsp.__version__}")
+                    except Exception:
+                        st.error("gspread no está instalado.")
+                    _raw_d = load_app_config("gcp_credentials_json", "")
+                    if _raw_d:
+                        try:
+                            _pd = json.loads(_raw_d)
+                            st.write(f"**Credenciales en DB:** {_pd.get('client_email','—')}")
+                            st.write(f"**Proyecto:** {_pd.get('project_id','—')}")
+                            st.write(f"**Tipo:** {_pd.get('type','—')}")
+                            _pk = _pd.get('private_key','')
+                            if _pk.startswith('-----BEGIN'):
+                                st.success("✅ private_key parece válida")
+                            else:
+                                st.error("❌ private_key inválida o vacía")
+                        except Exception as _de:
+                            st.error(f"JSON inválido en DB: {_de}")
+                    else:
+                        st.warning("No hay credenciales guardadas en DB")
+                    if sheets_url:
+                        _sid = GoogleSheetsManager._extract_sheet_id(sheets_url)
+                        st.write(f"**Sheet ID extraído:** {_sid}")
 
             # ── Botón de prueba de conexión ───────────────────────────────
             if not _ro and sheets_url and (_has_db or _has_secrets or _has_session):
