@@ -6003,12 +6003,124 @@ def _sidebar_nav(st, active_page: str, user_role: str, results: list) -> str:
     return st.session_state.get("_page", "upload")
 
 
+def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
+                           confidence_threshold, ocr_lang, ocr_dpi,
+                           use_easyocr, use_vision_ocr,
+                           campos_sel, tipo_consulta, max_workers,
+                           sheets_enabled, sheets_url, creds_path,
+                           project_id=None, user_id="", force_reprocess=False):
+    """
+    Ejecuta la extraccion sobre archivos subidos desde la UI de Streamlit.
+    Muestra barra de progreso, detecta duplicados, escribe a Sheets si esta habilitado
+    y almacena los resultados en st.session_state['results'].
+    """
+    import streamlit as _st
+
+    if not uploaded_files:
+        return
+
+    sheets_mgr = None
+    if sheets_enabled and sheets_url and creds_path:
+        try:
+            sheets_mgr = GoogleSheetsManager(sheets_url, creds_path)
+        except Exception as e:
+            _st.warning(f"No se pudo conectar a Google Sheets: {e}")
+
+    enable_anon     = _st.session_state.get("cfg_anon_v",     False)
+    enable_ensemble = _st.session_state.get("cfg_ensemble_v", True)
+
+    extractor = ClinicalExtractor(
+        api_key=api_key,
+        provider=provider,
+        model=model,
+        max_tokens=max_tokens,
+        ocr_lang=ocr_lang,
+        ocr_dpi=ocr_dpi,
+        campos=campos_sel,
+        confidence_threshold=confidence_threshold,
+        use_easyocr=use_easyocr,
+        use_vision_ocr=use_vision_ocr,
+        tipo_consulta=tipo_consulta,
+        project_id=project_id or DEFAULT_PROJECT_ID,
+        user_id=user_id,
+    )
+    extractor.enable_anonymization = enable_anon
+    extractor.enable_ensemble      = enable_ensemble
+
+    processor = BulkProcessor(
+        extractor=extractor,
+        sheets_manager=sheets_mgr,
+        max_workers=max_workers,
+    )
+
+    files_to_process = []
+    dup_log = _st.session_state.get("duplicate_log", [])
+
+    for uf in uploaded_files:
+        raw = uf.read()
+        file_hash = hashlib.sha256(raw).hexdigest()
+
+        if not force_reprocess:
+            prior = file_already_processed(file_hash)
+            if prior:
+                dup_log.append({
+                    "Archivo": uf.name,
+                    "Motivo": "hash_duplicado",
+                    "Detalle": "Ya procesado anteriormente",
+                    "Fecha previa": (prior.get("processed_at") or "")[:10],
+                })
+                continue
+
+        files_to_process.append((raw, uf.name, f"upload:{uf.name}"))
+
+    _st.session_state["duplicate_log"] = dup_log
+
+    if not files_to_process:
+        _st.warning("Todos los archivos ya fueron procesados anteriormente. "
+                    "Activa Forzar re-extraccion si deseas reprocesarlos.")
+        return
+
+    progress_bar = _st.progress(0, text="Iniciando extraccion...")
+    status_text  = _st.empty()
+
+    def _progress_cb(msg, pct):
+        progress_bar.progress(min(pct, 100), text=msg)
+        status_text.caption(msg)
+
+    with _st.spinner(f"Procesando {len(files_to_process)} archivo(s)..."):
+        new_results = processor.process_files(files_to_process, progress_callback=_progress_cb)
+
+    progress_bar.progress(100, text="Extraccion completada")
+    status_text.empty()
+
+    for res, (raw, fname, _src) in zip(new_results, files_to_process):
+        if res.get("_status") == "done":
+            file_hash = hashlib.sha256(raw).hexdigest()
+            try:
+                register_processed(
+                    file_hash=file_hash,
+                    filename=fname,
+                    project_id=project_id or DEFAULT_PROJECT_ID,
+                    user_id=user_id,
+                )
+            except Exception:
+                pass
+
+    existing = _st.session_state.get("results", [])
+    _st.session_state["results"] = existing + new_results
+
+    done   = sum(1 for r in new_results if r.get("_status") == "done")
+    errors = sum(1 for r in new_results if "error" in r.get("_status", ""))
+    _st.success(f"{done} documento(s) extraidos correctamente."
+                + (f" {errors} con error." if errors else ""))
+
+
 def _page_upload(st, user_payload, api_key, provider, model, max_tokens,
                   confidence_threshold, ocr_lang, ocr_dpi, use_easyocr,
                   use_vision_ocr, campos_sel, tipo_consulta, max_workers,
                   sheets_enabled, sheets_url, creds_path,
                   user_id, user_role):
-    """Página: subir documentos."""
+    """Pagina: subir documentos."""
     if not has_permission(user_payload, "extract"):
         st.warning("👁️ Tu rol (Lector) no permite extraer documentos.")
         return
