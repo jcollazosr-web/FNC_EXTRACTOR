@@ -3520,11 +3520,16 @@ class GoogleSheetsManager:
     def _ensure_headers(self, ws, headers: List[str]):
         try:
             existing = ws.row_values(1)
-            if not existing or existing != headers:
-                ws.clear()
+            if not existing:
+                # Hoja vacía — agregar headers
                 ws.append_row(headers, value_input_option="USER_ENTERED")
+                log.info(f"Headers creados en hoja '{ws.title}'")
+            elif existing != headers:
+                # Headers distintos — actualizar solo la primera fila sin borrar datos
+                ws.update("A1", [headers], value_input_option="USER_ENTERED")
+                log.info(f"Headers actualizados en hoja '{ws.title}'")
         except Exception as e:
-            log.warning(f"Error en _ensure_headers: {e}")
+            log.warning(f"Error en _ensure_headers ({ws.title}): {e}")
  
     def buffer_extraction(self, data: Dict, campos: List[str],
                            validation: Dict = None, alerts: List = None,
@@ -3581,20 +3586,29 @@ class GoogleSheetsManager:
         Mucho más rápido que append_row por fila.
         """
         campos = self._campos_header
- 
+        log.info(f"flush_batch: {len(self._buffer_data)} filas en buffer, "
+                 f"campos_header={campos[:3] if campos else 'VACÍO'}")
+
         # Hoja principal de datos
         if self._buffer_data:
             headers = (
                 ["FechaExtraccion", "Archivo", "Fuente", "Estado",
                  "Confianza", "RequiereRevision",
-                 "FileHash", "Proyecto"] + campos
+                 "FileHash", "Proyecto"] + (campos or [])
             )
-            self._ensure_headers(self.ws_data, headers)
-            self.ws_data.append_rows(
-                self._buffer_data, value_input_option="USER_ENTERED"
-            )
-            log.info(f"✅ Batch Sheets: {len(self._buffer_data)} filas escritas")
+            try:
+                self._ensure_headers(self.ws_data, headers)
+                self.ws_data.append_rows(
+                    self._buffer_data, value_input_option="USER_ENTERED"
+                )
+                log.info(f"✅ Sheets: {len(self._buffer_data)} filas escritas "
+                         f"en hoja '{self.ws_data.title}'")
+            except Exception as _fe:
+                log.error(f"❌ Error escribiendo a Sheets: {_fe}")
+                raise
             self._buffer_data = []
+        else:
+            log.warning("flush_batch: buffer vacío, nada que escribir")
  
         # Hoja de revisión manual
         if self._buffer_review:
