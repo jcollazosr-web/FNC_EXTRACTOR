@@ -7399,7 +7399,9 @@ def _page_settings(st, user_payload):
     _def_anon        = _saved.get("CEP_ENABLE_ANON", "0") == "1"
     _def_ensemble    = _saved.get("CEP_ENABLE_ENSEMBLE", "1") != "0"
     _def_ocr_thr     = int(_saved.get("CEP_OCR_THR", int(OCR_QUALITY_THRESHOLD)))
-    _def_sheets_url  = _saved.get("GOOGLE_SHEET_URL") or os.environ.get("GOOGLE_SHEET_URL","")
+    _def_sheets_url  = (load_app_config("GOOGLE_SHEET_URL", "") or
+                        _saved.get("GOOGLE_SHEET_URL") or
+                        os.environ.get("GOOGLE_SHEET_URL",""))
     _def_sf_user     = _saved.get("SF_USERNAME") or os.environ.get("SF_USERNAME","")
     _def_sf_domain   = _saved.get("SF_DOMAIN", "login")
     _def_sf_soql     = _saved.get("SF_SOQL", "")
@@ -8111,6 +8113,9 @@ def _page_settings(st, user_payload):
         # Google Sheets
         if sheets_enabled and sheets_url:
             _cfg_to_save["GOOGLE_SHEET_URL"] = sheets_url
+            # También guardar en DB cifrada para que persista en Streamlit Cloud
+            save_app_config("GOOGLE_SHEET_URL", sheets_url,
+                            updated_by=user_payload.get("sub", "admin"))
 
         # Salesforce
         if sf_enabled:
