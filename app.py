@@ -6472,13 +6472,29 @@ def _render_login_page(st):
                                 user["id"], user["email"], user["role"],
                                 ttl_hours=24 * 30  # 30 días
                             )
+                            # Registrar en tabla sessions para que is_token_valid lo acepte
+                            _lpl = verify_session_token(_long_token)
+                            if _lpl:
+                                _ljti = _lpl.get("jti", secrets.token_hex(16))
+                                _lexp = (datetime.utcnow() + timedelta(hours=24*30)).isoformat()
+                                _con2 = _sec_db()
+                                _con2.execute(
+                                    "INSERT OR IGNORE INTO sessions "
+                                    "(jti, user_id, token, created_at, expires_at, "
+                                    " ip_address, user_agent) VALUES (?,?,?,?,?,?,?)",
+                                    (_ljti, user["id"], _long_token,
+                                     datetime.utcnow().isoformat(), _lexp,
+                                     "web", "streamlit/remember")
+                                )
+                                _con2.commit()
                             save_app_config(
                                 f"remember_token_{user['id']}",
                                 _long_token,
                                 updated_by=user["id"]
                             )
                             _token = _long_token
-                        except Exception:
+                        except Exception as _re:
+                            log.warning(f"remember_me error: {_re}")
                             pass  # usar token normal si falla
                     st.session_state.update({
                         "_auth_token":       _token,
@@ -6494,6 +6510,11 @@ def _render_login_page(st):
                     st.error(f"🚫 {msg}")
         st.markdown(
             '<div class="sb">🔒 AES-256-GCM · bcrypt · JWT HS256 · Audit log</div>',
+            unsafe_allow_html=True)
+        st.markdown(
+            '<div style="text-align:center;font-size:.72rem;color:#3a4a6a;margin-top:18px;">'
+            'Desarrollado por <strong style="color:#5a7abf">Juan Manuel Collazos Rozo, MD, MSc.</strong><br>'
+            'Todos los derechos reservados</div>',
             unsafe_allow_html=True)
 
 
@@ -6642,9 +6663,13 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
             prior = file_already_processed(file_hash)
             if prior:
                 dup_log.append({
-                    "Archivo": uf.name,
-                    "Motivo": "hash_duplicado",
-                    "Detalle": "Ya procesado anteriormente",
+                    "Archivo":      uf.name,
+                    "filename":     uf.name,
+                    "reason":       "duplicate_in_db",
+                    "Motivo":       "Ya en base de datos local",
+                    "detail":       "Ya procesado anteriormente",
+                    "Detalle":      "Ya procesado anteriormente",
+                    "prior_date":   (prior.get("processed_at") or "")[:10],
                     "Fecha previa": (prior.get("processed_at") or "")[:10],
                 })
                 continue
@@ -7287,10 +7312,13 @@ def _page_dupes(st, user_id):
             "duplicate_in_sheets":  "Ya en Google Sheets",
         }
         df = pd.DataFrame([{
-            "Archivo":      d["filename"],
-            "Motivo":       reason_map.get(d["reason"], d["reason"]),
-            "Detalle":      d["detail"],
-            "Fecha previa": d.get("prior_date","—"),
+            "Archivo":      d.get("Archivo") or d.get("filename", "—"),
+            "Motivo":       reason_map.get(
+                                d.get("reason", d.get("Motivo", "")),
+                                d.get("Motivo") or d.get("reason", "—")
+                            ),
+            "Detalle":      d.get("Detalle") or d.get("detail", "—"),
+            "Fecha previa": d.get("Fecha previa") or d.get("prior_date", "—"),
         } for d in dup_log])
         st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -9122,7 +9150,13 @@ def run_streamlit():
     campos_sel           = cfg("cfg_campos_v",    PLANTILLAS_CONSULTA["General / Base"])
     tipo_consulta        = cfg("cfg_tipo_v",      "General / Base")
     sheets_enabled       = cfg("cfg_sheets_en",   False)
-    sheets_url           = cfg("cfg_sheets_url",  "")
+    # Fallback: si session_state está vacío (sesión nueva), leer desde DB/.env
+    sheets_url = (cfg("cfg_sheets_url", "") or
+                  load_app_config("GOOGLE_SHEET_URL", "") or
+                  os.environ.get("GOOGLE_SHEET_URL", ""))
+    # sheets_enabled: activar automáticamente si hay URL guardada
+    if sheets_url and not sheets_enabled:
+        sheets_enabled = True
     creds_path           = cfg("cfg_creds_path",  "")
     max_workers          = cfg("cfg_max_wrk",     2)
     sf_enabled           = cfg("cfg_sf_en",       False)
