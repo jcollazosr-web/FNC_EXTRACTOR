@@ -2920,6 +2920,342 @@ class SalesforceManager:
  
  
 # ─────────────────────────────────────────────────────────────
+# GOOGLE DRIVE MANAGER — leer archivos + escribir resultados
+# ─────────────────────────────────────────────────────────────
+
+class GoogleDriveManager:
+    """
+    Integración con Google Drive:
+    - Listar y descargar PDFs/imágenes desde una carpeta de Drive
+    - Subir archivos Excel con los resultados de extracción
+    Soporta cuentas personales y organizacionales (Service Account o OAuth2).
+    """
+
+    SCOPES = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+
+    def __init__(self, folder_url_or_id: str = "", credentials_path: str = ""):
+        self.folder_id = self._extract_folder_id(folder_url_or_id) if folder_url_or_id else ""
+        self.credentials_path = credentials_path
+        self.service = None
+        self._cred_data = None
+        self._connect()
+
+    @staticmethod
+    def _extract_folder_id(url_or_id: str) -> str:
+        import re as _re
+        url_or_id = url_or_id.strip()
+        # URL de carpeta: https://drive.google.com/drive/folders/ID
+        m = _re.search(r"/folders/([a-zA-Z0-9_-]+)", url_or_id)
+        if m:
+            return m.group(1)
+        # URL de archivo compartido: ?id=ID o /d/ID
+        m = _re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url_or_id)
+        if m:
+            return m.group(1)
+        m = _re.search(r"/d/([a-zA-Z0-9_-]+)", url_or_id)
+        if m:
+            return m.group(1)
+        # ID directo
+        if "/" not in url_or_id and len(url_or_id) > 10:
+            return url_or_id
+        return url_or_id
+
+    def _connect(self):
+        try:
+            from google.oauth2.service_account import Credentials
+            from googleapiclient.discovery import build as _build
+
+            self._cred_data = GoogleSheetsManager._load_credentials_data(self.credentials_path)
+            creds = Credentials.from_service_account_info(self._cred_data, scopes=self.SCOPES)
+            self.service = _build("drive", "v3", credentials=creds)
+            log.info("✅ Google Drive conectado")
+        except Exception as e:
+            log.error(f"❌ Google Drive: {e}")
+            raise
+
+    def list_files(self, folder_id: str = "", mime_filter: list = None) -> List[Dict]:
+        """
+        Lista archivos en una carpeta de Drive.
+        mime_filter: lista de MIME types, ej. ["application/pdf", "image/jpeg"]
+        Devuelve lista de {"id", "name", "mimeType", "size", "modifiedTime"}.
+        """
+        fid = folder_id or self.folder_id
+        if not fid:
+            raise ValueError("Se requiere un ID o URL de carpeta de Google Drive.")
+
+        mime_types = mime_filter or [
+            "application/pdf",
+            "image/jpeg", "image/jpg", "image/png", "image/tiff",
+        ]
+        mime_query = " or ".join(f"mimeType='{m}'" for m in mime_types)
+        query = f"'{fid}' in parents and ({mime_query}) and trashed=false"
+
+        files, page_token = [], None
+        while True:
+            resp = self.service.files().list(
+                q=query,
+                pageSize=100,
+                fields="nextPageToken, files(id,name,mimeType,size,modifiedTime)",
+                pageToken=page_token,
+            ).execute()
+            files.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return files
+
+    def download_file(self, file_id: str) -> bytes:
+        """Descarga el contenido binario de un archivo de Drive."""
+        from googleapiclient.http import MediaIoBaseDownload
+        import io
+        req = self.service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buf.getvalue()
+
+    def upload_excel(self, data: bytes, filename: str, folder_id: str = "") -> str:
+        """
+        Sube un archivo Excel (.xlsx) a Drive.
+        Devuelve la URL del archivo subido.
+        """
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        fid = folder_id or self.folder_id
+        meta = {
+            "name": filename,
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+        if fid:
+            meta["parents"] = [fid]
+        media = MediaIoBaseUpload(
+            io.BytesIO(data),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=True,
+        )
+        file_obj = self.service.files().create(
+            body=meta, media_body=media, fields="id,webViewLink"
+        ).execute()
+        url = file_obj.get("webViewLink", "")
+        log.info(f"✅ Excel subido a Drive: {filename} → {url}")
+        return url
+
+    def auto_grant_access(self, folder_id: str = "") -> dict:
+        """
+        Verifica y otorga acceso a la carpeta a la cuenta de servicio.
+        Devuelve dict con status y message igual que _auto_share_sheet.
+        """
+        fid = folder_id or self.folder_id
+        svc_email = (self._cred_data or {}).get("client_email", "")
+        return GoogleSheetsManager._auto_share_sheet(self.service, fid, svc_email)
+
+
+# ─────────────────────────────────────────────────────────────
+# ONEDRIVE MANAGER — leer archivos + escribir resultados
+# ─────────────────────────────────────────────────────────────
+
+class OneDriveManager:
+    """
+    Integración con Microsoft OneDrive / SharePoint mediante Microsoft Graph API.
+    Soporta cuentas personales (OAuth2 device flow) y organizacionales (Azure AD).
+
+    Configuración necesaria (guardada en DB cifrada):
+      - client_id:     ID de la app registrada en Azure
+      - tenant_id:     "consumers" para cuentas personales, ID del tenant para org.
+      - client_secret: solo para cuentas organizacionales (app confidential)
+    """
+
+    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+    # Scopes necesarios
+    SCOPES_PERSONAL = ["Files.ReadWrite", "offline_access"]
+    SCOPES_ORG      = ["https://graph.microsoft.com/Files.ReadWrite.All",
+                       "https://graph.microsoft.com/offline_access"]
+
+    def __init__(self, client_id: str, tenant_id: str = "consumers",
+                 client_secret: str = "", access_token: str = ""):
+        self.client_id     = client_id
+        self.tenant_id     = tenant_id           # "consumers" = personal, UUID = org
+        self.client_secret = client_secret
+        self._access_token = access_token
+        self._token_cache  = {}
+
+    # ── Autenticación ─────────────────────────────────────────────────────
+
+    def get_device_flow_url(self) -> dict:
+        """
+        Inicia el flujo de autenticación por dispositivo (para cuentas personales o org).
+        Devuelve {"user_code", "verification_uri", "device_code", "expires_in"}.
+        El usuario debe ir a la URL y escribir el código.
+        """
+        import requests as _req
+        url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/devicecode"
+        scopes = " ".join(self.SCOPES_PERSONAL if self.tenant_id == "consumers"
+                          else self.SCOPES_ORG)
+        resp = _req.post(url, data={
+            "client_id": self.client_id,
+            "scope": scopes,
+        })
+        resp.raise_for_status()
+        return resp.json()
+
+    def poll_device_flow(self, device_code: str) -> dict:
+        """
+        Sondea si el usuario ya autorizó. Devuelve {"access_token", "refresh_token"}
+        o {"error": "authorization_pending"} si aún no lo hizo.
+        """
+        import requests as _req
+        url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        resp = _req.post(url, data={
+            "client_id":   self.client_id,
+            "device_code": device_code,
+            "grant_type":  "urn:ietf:params:oauth2:grant-type:device_code",
+        })
+        return resp.json()
+
+    def auth_with_client_credentials(self) -> str:
+        """
+        Autenticación server-to-server para cuentas organizacionales
+        (requiere client_secret). Devuelve access_token.
+        """
+        import requests as _req
+        url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        resp = _req.post(url, data={
+            "client_id":     self.client_id,
+            "client_secret": self.client_secret,
+            "scope":         "https://graph.microsoft.com/.default",
+            "grant_type":    "client_credentials",
+        })
+        resp.raise_for_status()
+        data = resp.json()
+        self._access_token = data["access_token"]
+        return self._access_token
+
+    def set_token(self, token: str):
+        self._access_token = token
+
+    def _headers(self) -> dict:
+        if not self._access_token:
+            raise RuntimeError("OneDrive: no hay token de acceso. Autentícate primero.")
+        return {"Authorization": f"Bearer {self._access_token}",
+                "Content-Type": "application/json"}
+
+    # ── Listar y descargar archivos ───────────────────────────────────────
+
+    def list_files(self, folder_path: str = "/") -> List[Dict]:
+        """
+        Lista archivos PDF e imágenes en una carpeta de OneDrive.
+        folder_path: ruta relativa, ej. "/Historias Clinicas"
+        Devuelve lista de {"id", "name", "size", "webUrl", "mimeType"}.
+        """
+        import requests as _req
+        VALID_EXT = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif"}
+
+        if folder_path in ("", "/"):
+            url = f"{self.GRAPH_BASE}/me/drive/root/children"
+        else:
+            folder_path = folder_path.strip("/")
+            url = f"{self.GRAPH_BASE}/me/drive/root:/{folder_path}:/children"
+
+        files, next_link = [], url
+        while next_link:
+            resp = _req.get(next_link, headers=self._headers(),
+                            params={"$top": 100, "$select":
+                                    "id,name,size,webUrl,file,lastModifiedDateTime"})
+            resp.raise_for_status()
+            data = resp.json()
+            for item in data.get("value", []):
+                if "file" in item:
+                    ext = "." + item["name"].rsplit(".", 1)[-1].lower() if "." in item["name"] else ""
+                    if ext in VALID_EXT:
+                        files.append({
+                            "id":           item["id"],
+                            "name":         item["name"],
+                            "size":         item.get("size", 0),
+                            "webUrl":       item.get("webUrl", ""),
+                            "mimeType":     item.get("file", {}).get("mimeType", ""),
+                            "modified":     item.get("lastModifiedDateTime", ""),
+                        })
+            next_link = data.get("@odata.nextLink")
+        return files
+
+    def download_file(self, file_id: str) -> bytes:
+        """Descarga el contenido binario de un archivo de OneDrive."""
+        import requests as _req
+        url = f"{self.GRAPH_BASE}/me/drive/items/{file_id}/content"
+        resp = _req.get(url, headers=self._headers(), allow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+
+    # ── Subir resultados ──────────────────────────────────────────────────
+
+    def upload_excel(self, data: bytes, filename: str,
+                     folder_path: str = "/Extracciones_Clinicas") -> str:
+        """
+        Sube un archivo Excel a una carpeta de OneDrive.
+        Crea la carpeta si no existe. Devuelve la URL del archivo.
+        """
+        import requests as _req
+        folder_path = folder_path.strip("/")
+        if folder_path:
+            upload_url = (f"{self.GRAPH_BASE}/me/drive/root:/"
+                          f"{folder_path}/{filename}:/content")
+        else:
+            upload_url = f"{self.GRAPH_BASE}/me/drive/root:/{filename}:/content"
+
+        headers = {
+            "Authorization": f"Bearer {self._access_token}",
+            "Content-Type": ("application/vnd.openxmlformats-officedocument"
+                             ".spreadsheetml.sheet"),
+        }
+        resp = _req.put(upload_url, headers=headers, data=data)
+        resp.raise_for_status()
+        result = resp.json()
+        url = result.get("webUrl", "")
+        log.info(f"✅ Excel subido a OneDrive: {filename} → {url}")
+        return url
+
+    def write_results_excel(self, results: List[Dict], campos: List[str],
+                             folder_path: str = "/Extracciones_Clinicas") -> str:
+        """
+        Convierte los resultados a Excel y los sube a OneDrive.
+        Devuelve la URL del archivo.
+        """
+        import io
+        rows = []
+        for r in results:
+            if r.get("_status") != "done":
+                continue
+            row = {
+                "Archivo":    r.get("_filename", ""),
+                "Confianza":  f"{r.get('_confidence', 0):.0%}",
+                "Estado":     r.get("_status", ""),
+                "Fecha":      datetime.utcnow().strftime("%Y-%m-%d"),
+            }
+            for c in campos:
+                row[c] = r.get(c, "")
+            rows.append(row)
+
+        if not rows:
+            raise ValueError("No hay resultados completados para exportar.")
+
+        df = pd.DataFrame(rows)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Extracciones")
+        buf.seek(0)
+
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"Clinical_Extracciones_{ts}.xlsx"
+        return self.upload_excel(buf.getvalue(), filename, folder_path)
+
+
+# ─────────────────────────────────────────────────────────────
 # GOOGLE SHEETS MANAGER (batch mejorado)
 # ─────────────────────────────────────────────────────────────
  
@@ -3034,40 +3370,58 @@ class GoogleSheetsManager:
         )
 
     @staticmethod
-    def _auto_share_sheet(drive_service, sheet_id: str, service_account_email: str):
+    def _auto_share_sheet(drive_service, sheet_id: str, service_account_email: str) -> dict:
         """
-        Comparte el Sheet automáticamente con el email de la cuenta de servicio
-        usando la API de Google Drive. Si ya tiene acceso, no hace nada.
+        Comparte el Sheet con la cuenta de servicio si no tiene acceso aún.
+        Devuelve un dict con:
+          - status: "ya_compartido" | "compartido_ahora" | "error"
+          - message: descripción legible
+          - email: email de la cuenta de servicio
         """
+        result = {"email": service_account_email, "status": "error", "message": ""}
         try:
-            # Verificar si ya tiene permiso
+            # Listar permisos actuales del archivo
             perms = drive_service.permissions().list(
-                fileId=sheet_id, fields="permissions(emailAddress,role)"
+                fileId=sheet_id,
+                fields="permissions(emailAddress,role)"
             ).execute().get("permissions", [])
 
             already = any(
                 p.get("emailAddress", "").lower() == service_account_email.lower()
                 for p in perms
             )
-            if already:
-                log.info(f"✅ Sheet ya compartido con {service_account_email}")
-                return True
 
-            # Compartir con rol editor
-            drive_service.permissions().create(
-                fileId=sheet_id,
-                body={
-                    "type": "user",
-                    "role": "writer",
-                    "emailAddress": service_account_email,
-                },
-                sendNotificationEmail=False,
-            ).execute()
-            log.info(f"✅ Sheet compartido automáticamente con {service_account_email}")
-            return True
+            if already:
+                result["status"]  = "ya_compartido"
+                result["message"] = f"El Sheet ya estaba compartido con `{service_account_email}`."
+                log.info(f"✅ Sheet ya compartido con {service_account_email}")
+            else:
+                # Otorgar permiso de escritura
+                drive_service.permissions().create(
+                    fileId=sheet_id,
+                    body={
+                        "type": "user",
+                        "role": "writer",
+                        "emailAddress": service_account_email,
+                    },
+                    sendNotificationEmail=False,
+                ).execute()
+                result["status"]  = "compartido_ahora"
+                result["message"] = (
+                    f"Permiso otorgado ahora mismo a `{service_account_email}` "
+                    f"(rol: Editor)."
+                )
+                log.info(f"✅ Sheet compartido automáticamente con {service_account_email}")
+
         except Exception as e:
-            log.warning(f"No se pudo compartir el Sheet automáticamente: {e}")
-            return False
+            result["status"]  = "error"
+            result["message"] = (
+                f"No se pudo compartir con `{service_account_email}`: {e}. "
+                "Compártelo manualmente desde Google Sheets → Compartir."
+            )
+            log.warning(result["message"])
+
+        return result
 
     def _connect(self):
         try:
@@ -6121,6 +6475,8 @@ def _sidebar_nav(st, active_page: str, user_role: str, results: list) -> str:
 
         pages_main = [
             ("📤  Subir documentos", "upload"),
+            ("📂  Google Drive",     "gdrive"),
+            ("🔷  OneDrive",         "onedrive"),
             ("☁️  Salesforce",       "salesforce"),
             ("📋  Resultados",       "results"),
             ("⚠️  Revisar manualmente", "review"),
@@ -7137,27 +7493,331 @@ def _page_settings(st, user_payload):
 
             # ── Botón de prueba de conexión ───────────────────────────────
             if not _ro and sheets_url and (_has_db or _has_secrets or _has_session):
-                if st.button("Probar conexion y auto-compartir", key="btn_test_sheets"):
-                    with st.spinner("Conectando con Google Sheets..."):
+                if st.button("🔌 Probar conexión", key="btn_test_sheets", type="primary"):
+                    with st.spinner("Verificando conexión con Google Sheets..."):
                         try:
-                            _mgr = GoogleSheetsManager(sheets_url, "")
+                            # Cargar credenciales
+                            _raw_creds = load_app_config("gcp_credentials_json", "")
+                            if not _raw_creds:
+                                try:
+                                    import streamlit as _st2
+                                    _raw_creds = json.dumps(
+                                        dict(_st2.secrets.get("gcp_service_account", {}))
+                                    )
+                                except Exception:
+                                    pass
                             _svc_email = ""
                             try:
-                                _raw = load_app_config("gcp_credentials_json", "")
-                                if not _raw:
-                                    import streamlit as _st2
-                                    _raw = json.dumps(dict(_st2.secrets.get("gcp_service_account", {})))
-                                _svc_email = json.loads(_raw).get("client_email", "")
+                                _svc_email = json.loads(_raw_creds).get("client_email", "")
                             except Exception:
                                 pass
-                            st.success(
-                                "Conectado a: " + _mgr.spreadsheet.title + ". "
-                                + ("Compartido con " + _svc_email if _svc_email else "")
+
+                            # Conectar (incluye auto-share internamente)
+                            _mgr = GoogleSheetsManager(sheets_url, "")
+
+                            # Obtener resultado del auto-share para mostrarlo
+                            from google.oauth2.service_account import Credentials as _GCreds
+                            from googleapiclient.discovery import build as _gbuild
+                            _cred_data = json.loads(_raw_creds)
+                            _creds = _GCreds.from_service_account_info(
+                                _cred_data,
+                                scopes=[
+                                    "https://www.googleapis.com/auth/spreadsheets",
+                                    "https://www.googleapis.com/auth/drive",
+                                ]
                             )
+                            _drive = _gbuild("drive", "v3", credentials=_creds)
+                            _sheet_id = GoogleSheetsManager._extract_sheet_id(sheets_url)
+                            _share_result = GoogleSheetsManager._auto_share_sheet(
+                                _drive, _sheet_id, _svc_email
+                            )
+
+                            # ── Mostrar resultado detallado ───────────────
+                            st.success(f"✅ Conectado a: **{_mgr.spreadsheet.title}**")
+
+                            _status = _share_result.get("status")
+                            _msg    = _share_result.get("message", "")
+
+                            if _status == "ya_compartido":
+                                st.info(f"🔗 **Permisos:** {_msg}")
+                            elif _status == "compartido_ahora":
+                                st.success(f"🎉 **Compartido ahora:** {_msg}")
+                            elif _status == "error":
+                                st.warning(
+                                    "No se pudo compartir automaticamente. "
+                                    + _msg + " "
+                                    "Puedes compartirlo manualmente: abre el Sheet, "
+                                    "haz clic en Compartir, pega el email "
+                                    + _svc_email + " y asigna rol Editor."
+                                )
+
+                            st.caption(
+                                f"📋 Hojas disponibles: "
+                                + ", ".join([
+                                    ws.title for ws in _mgr.spreadsheet.worksheets()
+                                ])
+                            )
+
                         except Exception as _e:
-                            st.error(str(_e))
+                            st.error(f"❌ Error de conexión: {_e}")
 
             st.caption("Sincronizacion bidireccional de deduplicacion con Sheets")
+
+    # ── Google Drive ────────────────────────────────────────────────────────
+    with st.expander("📂 Google Drive (leer archivos + exportar Excel)"):
+        gdrive_enabled = st.checkbox("Habilitar Google Drive", key="cfg_gdrive", disabled=_ro)
+        gdrive_folder_url = ""
+        gdrive_export_folder = ""
+        if gdrive_enabled:
+            gdrive_folder_url = st.text_input(
+                "URL o ID de carpeta (para leer PDFs/imágenes)",
+                value=load_app_config("gdrive_folder_url", ""),
+                key="cfg_gdrive_folder", disabled=_ro,
+                help="Carpeta de Drive donde están los documentos a procesar. "
+                     "La app la comparte automáticamente con la cuenta de servicio."
+            )
+            gdrive_export_folder = st.text_input(
+                "URL o ID de carpeta de exportación (para guardar resultados Excel)",
+                value=load_app_config("gdrive_export_folder", ""),
+                key="cfg_gdrive_export", disabled=_ro,
+                help="Carpeta donde se subirán los archivos Excel con los resultados."
+            )
+            st.caption("Usa las mismas credenciales JSON de Google configuradas arriba.")
+
+            if not _ro:
+                _has_gdrive_creds = bool(load_app_config("gcp_credentials_json", ""))
+                if not _has_gdrive_creds:
+                    try:
+                        import streamlit as _stg
+                        _has_gdrive_creds = "gcp_service_account" in _stg.secrets
+                    except Exception:
+                        pass
+
+                if _has_gdrive_creds and gdrive_folder_url:
+                    if st.button("🔌 Probar conexión Drive", key="btn_test_gdrive"):
+                        with st.spinner("Conectando con Google Drive..."):
+                            try:
+                                _gdmgr = GoogleDriveManager(gdrive_folder_url)
+                                _files  = _gdmgr.list_files()
+                                _share  = _gdmgr.auto_grant_access()
+                                st.success(
+                                    f"✅ Carpeta accesible. "
+                                    f"{len(_files)} archivo(s) encontrado(s) "
+                                    f"(PDF, JPG, PNG, TIFF)."
+                                )
+                                _st_share = _share.get("status")
+                                if _st_share == "ya_compartido":
+                                    st.info(f"🔗 {_share['message']}")
+                                elif _st_share == "compartido_ahora":
+                                    st.success(f"🎉 {_share['message']}")
+                                else:
+                                    st.warning(_share.get("message", ""))
+                                if not _ro and gdrive_folder_url:
+                                    save_app_config("gdrive_folder_url", gdrive_folder_url,
+                                                    user_payload.get("sub","admin"))
+                                if not _ro and gdrive_export_folder:
+                                    save_app_config("gdrive_export_folder", gdrive_export_folder,
+                                                    user_payload.get("sub","admin"))
+                            except Exception as _e:
+                                st.error(f"❌ {_e}")
+                elif not _has_gdrive_creds:
+                    st.warning("⚠️ Primero guarda las credenciales JSON de Google arriba.")
+
+    # ── OneDrive / Microsoft 365 ────────────────────────────────────────────
+    with st.expander("🔷 OneDrive / Microsoft 365 (leer archivos + exportar Excel)"):
+        od_enabled = st.checkbox("Habilitar OneDrive", key="cfg_od", disabled=_ro)
+        od_client_id = od_tenant_id = od_client_secret = od_token = ""
+        od_folder = od_export_folder = ""
+        if od_enabled:
+            st.markdown("**Credenciales de Microsoft Azure**")
+            st.caption(
+                "Necesitas registrar una app en [portal.azure.com](https://portal.azure.com). "
+                "En la sección de Ayuda encontrarás el paso a paso."
+            )
+            oa1, oa2 = st.columns(2)
+            od_client_id = oa1.text_input(
+                "Client ID (Application ID)",
+                value=load_app_config("od_client_id", ""),
+                key="cfg_od_clientid", disabled=_ro,
+                type="password"
+            )
+            od_tenant_id = oa2.selectbox(
+                "Tipo de cuenta",
+                ["consumers", "organizations", "common"],
+                index=["consumers","organizations","common"].index(
+                    load_app_config("od_tenant_id", "consumers")
+                    if load_app_config("od_tenant_id","consumers")
+                    in ["consumers","organizations","common"] else "consumers"
+                ),
+                key="cfg_od_tenant", disabled=_ro,
+                format_func=lambda x: {
+                    "consumers":    "Personal (Outlook / Hotmail)",
+                    "organizations":"Organizacional (Microsoft 365 / Azure AD)",
+                    "common":       "Ambas (automático)",
+                }.get(x, x)
+            )
+            if od_tenant_id == "organizations":
+                od_client_secret = st.text_input(
+                    "Client Secret (solo para cuentas organizacionales)",
+                    value=load_app_config("od_client_secret", ""),
+                    key="cfg_od_secret", disabled=_ro, type="password"
+                )
+
+            st.markdown("**Carpetas de OneDrive**")
+            of1, of2 = st.columns(2)
+            od_folder = of1.text_input(
+                "Carpeta de lectura (ruta relativa)",
+                value=load_app_config("od_folder", "/"),
+                key="cfg_od_folder", disabled=_ro,
+                placeholder="/Historias Clinicas",
+                help="Ruta dentro de tu OneDrive. Usa / para la raíz."
+            )
+            od_export_folder = of2.text_input(
+                "Carpeta de exportación",
+                value=load_app_config("od_export_folder", "/Extracciones_Clinicas"),
+                key="cfg_od_exportfolder", disabled=_ro,
+                placeholder="/Extracciones_Clinicas"
+            )
+
+            # Token almacenado
+            od_token = load_app_config("od_access_token", "")
+
+            if not _ro:
+                st.markdown("**Autenticación**")
+
+                # Mostrar estado del token
+                if od_token:
+                    st.success("✅ Token de acceso guardado. La conexión está activa.")
+                    if st.button("🗑️ Revocar token", key="btn_od_revoke"):
+                        save_app_config("od_access_token", "",
+                                        user_payload.get("sub","admin"))
+                        st.rerun()
+                else:
+                    st.info("No hay token guardado. Usa el botón de abajo para autenticarte.")
+
+                if od_client_id:
+                    # Autenticación por client credentials (org)
+                    if od_tenant_id == "organizations" and od_client_secret:
+                        if st.button("🔑 Autenticar (Client Credentials)", key="btn_od_cc"):
+                            with st.spinner("Autenticando..."):
+                                try:
+                                    _od = OneDriveManager(od_client_id, od_tenant_id,
+                                                          od_client_secret)
+                                    _tok = _od.auth_with_client_credentials()
+                                    save_app_config("od_access_token", _tok,
+                                                    user_payload.get("sub","admin"))
+                                    # Guardar configuración
+                                    for _k, _v in [
+                                        ("od_client_id",     od_client_id),
+                                        ("od_tenant_id",     od_tenant_id),
+                                        ("od_client_secret", od_client_secret),
+                                        ("od_folder",        od_folder),
+                                        ("od_export_folder", od_export_folder),
+                                    ]:
+                                        if _v:
+                                            save_app_config(_k, _v,
+                                                            user_payload.get("sub","admin"))
+                                    st.success("✅ Autenticación exitosa.")
+                                    st.rerun()
+                                except Exception as _e:
+                                    st.error(f"❌ {_e}")
+                    else:
+                        # Device flow (personal o org sin secret)
+                        if st.button("🔑 Iniciar autenticación con Microsoft",
+                                     key="btn_od_device"):
+                            with st.spinner("Iniciando flujo de autenticación..."):
+                                try:
+                                    _od = OneDriveManager(od_client_id, od_tenant_id)
+                                    _flow = _od.get_device_flow_url()
+                                    st.session_state["_od_device_code"]  = _flow.get("device_code","")
+                                    st.session_state["_od_client_id"]    = od_client_id
+                                    st.session_state["_od_tenant_id"]    = od_tenant_id
+                                    st.session_state["_od_folder"]       = od_folder
+                                    st.session_state["_od_export_folder"]= od_export_folder
+                                    _vuri  = _flow.get("verification_uri", "")
+                                    _ucode = _flow.get("user_code", "")
+                                    st.info(
+                                        "Paso 1: Abre esta URL en tu navegador: "
+                                        + _vuri + "  \n\n"
+                                        "Paso 2: Ingresa este codigo: " + _ucode + "  \n\n"
+                                        "Paso 3: Haz clic en Confirmar autorizacion abajo."
+                                    )
+                                except Exception as _e:
+                                    st.error(f"❌ {_e}")
+
+                        if st.session_state.get("_od_device_code"):
+                            if st.button("✅ Confirmar autorización", key="btn_od_confirm"):
+                                with st.spinner("Verificando..."):
+                                    try:
+                                        _od2 = OneDriveManager(
+                                            st.session_state["_od_client_id"],
+                                            st.session_state["_od_tenant_id"]
+                                        )
+                                        _result = _od2.poll_device_flow(
+                                            st.session_state["_od_device_code"]
+                                        )
+                                        if "access_token" in _result:
+                                            save_app_config(
+                                                "od_access_token",
+                                                _result["access_token"],
+                                                user_payload.get("sub","admin")
+                                            )
+                                            for _k, _v in [
+                                                ("od_client_id",
+                                                 st.session_state["_od_client_id"]),
+                                                ("od_tenant_id",
+                                                 st.session_state["_od_tenant_id"]),
+                                                ("od_folder",
+                                                 st.session_state.get("_od_folder","/")),
+                                                ("od_export_folder",
+                                                 st.session_state.get("_od_export_folder",
+                                                                       "/Extracciones_Clinicas")),
+                                            ]:
+                                                if _v:
+                                                    save_app_config(_k, _v,
+                                                        user_payload.get("sub","admin"))
+                                            st.session_state.pop("_od_device_code", None)
+                                            st.success("✅ Autenticación completada y guardada.")
+                                            st.rerun()
+                                        elif _result.get("error") == "authorization_pending":
+                                            st.warning("⏳ Aún no has autorizado. "
+                                                       "Completa el paso en el navegador y vuelve.")
+                                        else:
+                                            st.error(f"Error: {_result.get('error_description','')}")
+                                    except Exception as _e:
+                                        st.error(f"❌ {_e}")
+
+                    # Probar conexión si hay token
+                    if od_token and st.button("🔌 Probar conexión OneDrive",
+                                              key="btn_test_od"):
+                        with st.spinner("Verificando..."):
+                            try:
+                                _od3 = OneDriveManager(
+                                    load_app_config("od_client_id",""),
+                                    load_app_config("od_tenant_id","consumers"),
+                                    access_token=od_token
+                                )
+                                _files = _od3.list_files(
+                                    load_app_config("od_folder","/")
+                                )
+                                st.success(
+                                    f"✅ Conectado a OneDrive. "
+                                    f"{len(_files)} archivo(s) encontrado(s) "
+                                    f"(PDF, imágenes) en la carpeta configurada."
+                                )
+                                if _files:
+                                    st.dataframe(
+                                        pd.DataFrame([{
+                                            "Nombre": f["name"],
+                                            "Tamaño": f"{int(f.get('size',0))//1024} KB",
+                                            "Modificado": f.get("modified","")[:10],
+                                        } for f in _files[:10]]),
+                                        use_container_width=True, hide_index=True
+                                    )
+                            except Exception as _e:
+                                st.error(f"❌ {_e}")
+                else:
+                    st.warning("⚠️ Ingresa el Client ID para continuar.")
 
     with st.expander("☁️ Salesforce"):
         sf_enabled = st.checkbox("Habilitar Salesforce", key="cfg_sf", disabled=_ro)
@@ -7700,6 +8360,301 @@ def _render_force_change_password(st, user_payload: Dict, user_id: str, token: s
                    "Nadie — ni el administrador — puede verla.")
 
 
+def _page_gdrive(st, user_payload, api_key, provider, model, max_tokens,
+                  confidence_threshold, ocr_lang, ocr_dpi, use_easyocr,
+                  use_vision_ocr, campos_sel, tipo_consulta, max_workers,
+                  sheets_enabled, sheets_url, creds_path, user_id):
+    """Pagina: importar desde Google Drive y exportar resultados a Drive."""
+    if not has_permission(user_payload, "extract"):
+        st.warning("Tu rol no permite extraer documentos.")
+        return
+
+    # Verificar credenciales
+    _has_creds = bool(load_app_config("gcp_credentials_json", ""))
+    if not _has_creds:
+        try:
+            import streamlit as _stg
+            _has_creds = "gcp_service_account" in _stg.secrets
+        except Exception:
+            pass
+
+    if not _has_creds:
+        st.error("Primero configura las credenciales de Google en "
+                 "Configuracion > Google Sheets > Editor JSON.")
+        return
+
+    tab_read, tab_export = st.tabs(["📥 Leer documentos desde Drive",
+                                     "📤 Exportar resultados a Drive"])
+
+    # ── TAB LECTURA ──────────────────────────────────────────────────────────
+    with tab_read:
+        st.markdown("Lee PDFs e imagenes directamente desde una carpeta de Google Drive.")
+        folder_url = st.text_input(
+            "URL o ID de la carpeta de Drive",
+            value=load_app_config("gdrive_folder_url", ""),
+            placeholder="https://drive.google.com/drive/folders/...",
+            key="gdrive_folder_read"
+        )
+        if st.button("📋 Listar archivos", key="btn_gdrive_list") and folder_url:
+            with st.spinner("Conectando con Google Drive..."):
+                try:
+                    _mgr = GoogleDriveManager(folder_url)
+                    _files = _mgr.list_files()
+                    if not _files:
+                        st.warning("No se encontraron PDFs ni imagenes en esa carpeta.")
+                    else:
+                        st.success(f"{len(_files)} archivo(s) encontrado(s).")
+                        st.session_state["_gdrive_files"] = _files
+                        st.session_state["_gdrive_mgr_folder"] = folder_url
+                        save_app_config("gdrive_folder_url", folder_url,
+                                        user_payload.get("sub","admin"))
+                except Exception as _e:
+                    st.error(f"Error: {_e}")
+
+        _files = st.session_state.get("_gdrive_files", [])
+        if _files:
+            st.dataframe(pd.DataFrame([{
+                "Nombre":      f["name"],
+                "Tamano KB":   f"{int(f.get('size',0))//1024}",
+                "Modificado":  f.get("modified","")[:10],
+            } for f in _files]), use_container_width=True, hide_index=True)
+
+            _sel = st.multiselect(
+                "Selecciona archivos a procesar",
+                options=[f["name"] for f in _files],
+                default=[f["name"] for f in _files],
+                key="gdrive_sel_files"
+            )
+            force = st.checkbox("Forzar re-extraccion", key="gdrive_force")
+
+            if st.button(f"Iniciar extraccion — {len(_sel)} archivo(s)",
+                         type="primary", key="btn_gdrive_extract",
+                         disabled=not _sel or not api_key):
+                if not api_key:
+                    st.warning("Configura la API Key en Configuracion.")
+                else:
+                    _selected = [f for f in _files if f["name"] in _sel]
+                    _prog = st.progress(0, text="Descargando desde Drive...")
+                    _status = st.empty()
+                    _downloaded = []
+                    try:
+                        _gd = GoogleDriveManager(
+                            st.session_state.get("_gdrive_mgr_folder","")
+                        )
+                        for i, _f in enumerate(_selected):
+                            _status.caption(f"Descargando {_f['name']}...")
+                            _raw = _gd.download_file(_f["id"])
+                            _downloaded.append((_raw, _f["name"]))
+                            _prog.progress(int((i+1)/len(_selected)*50),
+                                           text=f"Descargado {i+1}/{len(_selected)}")
+                    except Exception as _e:
+                        st.error(f"Error descargando: {_e}")
+                        return
+
+                    # Crear objetos tipo UploadedFile para reutilizar _run_extraction_local
+                    class _FakeFile:
+                        def __init__(self, raw, name):
+                            self._raw = raw
+                            self.name = name
+                            self.size = len(raw)
+                        def read(self): return self._raw
+
+                    _fake_files = [_FakeFile(r, n) for r, n in _downloaded]
+                    _prog.progress(50, text="Procesando con IA...")
+                    _run_extraction_local(
+                        _fake_files, api_key, provider, model, max_tokens,
+                        confidence_threshold, ocr_lang, ocr_dpi,
+                        use_easyocr, use_vision_ocr,
+                        campos_sel, tipo_consulta, max_workers,
+                        sheets_enabled, sheets_url, creds_path,
+                        project_id=st.session_state.get("_active_project_id",
+                                                         DEFAULT_PROJECT_ID),
+                        user_id=user_id,
+                        force_reprocess=force,
+                    )
+
+    # ── TAB EXPORTAR ─────────────────────────────────────────────────────────
+    with tab_export:
+        st.markdown("Sube los resultados extraidos como archivo Excel a Google Drive.")
+        export_folder = st.text_input(
+            "URL o ID de carpeta de destino en Drive",
+            value=load_app_config("gdrive_export_folder", ""),
+            placeholder="https://drive.google.com/drive/folders/...",
+            key="gdrive_export_folder_input"
+        )
+        results = st.session_state.get("results", [])
+        done_count = sum(1 for r in results if r.get("_status") == "done")
+        st.caption(f"{done_count} resultado(s) listos para exportar.")
+
+        if st.button("📤 Subir Excel a Drive", key="btn_gdrive_upload",
+                     type="primary", disabled=done_count == 0 or not export_folder):
+            with st.spinner("Subiendo a Google Drive..."):
+                try:
+                    _gd2 = GoogleDriveManager(export_folder)
+                    import io as _io
+                    _rows = []
+                    for r in results:
+                        if r.get("_status") != "done":
+                            continue
+                        row = {"Archivo": r.get("_filename",""),
+                               "Confianza": f"{r.get('_confidence',0):.0%}"}
+                        for c in campos_sel:
+                            row[c] = r.get(c, "")
+                        _rows.append(row)
+                    _df = pd.DataFrame(_rows)
+                    _buf = _io.BytesIO()
+                    with pd.ExcelWriter(_buf, engine="openpyxl") as _wr:
+                        _df.to_excel(_wr, index=False, sheet_name="Extracciones")
+                    _buf.seek(0)
+                    _ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    _fname = f"Clinical_Extracciones_{_ts}.xlsx"
+                    _url = _gd2.upload_excel(_buf.getvalue(), _fname,
+                                             GoogleDriveManager._extract_folder_id(export_folder))
+                    save_app_config("gdrive_export_folder", export_folder,
+                                    user_payload.get("sub","admin"))
+                    st.success(f"Archivo subido exitosamente.")
+                    if _url:
+                        st.markdown(f"[Abrir en Google Drive]({_url})")
+                except Exception as _e:
+                    st.error(f"Error: {_e}")
+
+
+def _page_onedrive(st, user_payload, api_key, provider, model, max_tokens,
+                    confidence_threshold, ocr_lang, ocr_dpi, use_easyocr,
+                    use_vision_ocr, campos_sel, tipo_consulta, max_workers,
+                    user_id):
+    """Pagina: importar desde OneDrive y exportar resultados."""
+    if not has_permission(user_payload, "extract"):
+        st.warning("Tu rol no permite extraer documentos.")
+        return
+
+    _od_token     = load_app_config("od_access_token", "")
+    _od_client_id = load_app_config("od_client_id", "")
+    _od_tenant    = load_app_config("od_tenant_id", "consumers")
+    _od_folder    = load_app_config("od_folder", "/")
+    _od_export    = load_app_config("od_export_folder", "/Extracciones_Clinicas")
+
+    if not _od_client_id or not _od_token:
+        st.error("Primero configura y autenticate con OneDrive en "
+                 "Configuracion > OneDrive.")
+        if st.button("Ir a Configuracion", key="btn_od_goto_cfg"):
+            st.session_state["_page"] = "settings"
+            st.rerun()
+        return
+
+    _od_mgr = OneDriveManager(_od_client_id, _od_tenant, access_token=_od_token)
+
+    tab_read, tab_export = st.tabs(["📥 Leer documentos desde OneDrive",
+                                     "📤 Exportar resultados a OneDrive"])
+
+    # ── TAB LECTURA ──────────────────────────────────────────────────────────
+    with tab_read:
+        st.markdown("Lee PDFs e imagenes directamente desde tu OneDrive.")
+        od_folder_input = st.text_input(
+            "Carpeta de OneDrive (ruta relativa)",
+            value=_od_folder,
+            placeholder="/Historias Clinicas",
+            key="od_folder_input"
+        )
+        if st.button("📋 Listar archivos", key="btn_od_list"):
+            with st.spinner("Consultando OneDrive..."):
+                try:
+                    _files = _od_mgr.list_files(od_folder_input)
+                    if not _files:
+                        st.warning("No se encontraron PDFs ni imagenes en esa carpeta.")
+                    else:
+                        st.success(f"{len(_files)} archivo(s) encontrado(s).")
+                        st.session_state["_od_files"] = _files
+                        save_app_config("od_folder", od_folder_input,
+                                        user_payload.get("sub","admin"))
+                except Exception as _e:
+                    st.error(f"Error: {_e}")
+
+        _od_files = st.session_state.get("_od_files", [])
+        if _od_files:
+            st.dataframe(pd.DataFrame([{
+                "Nombre":     f["name"],
+                "Tamano KB":  f"{int(f.get('size',0))//1024}",
+                "Modificado": f.get("modified","")[:10],
+            } for f in _od_files]), use_container_width=True, hide_index=True)
+
+            _sel = st.multiselect(
+                "Selecciona archivos a procesar",
+                options=[f["name"] for f in _od_files],
+                default=[f["name"] for f in _od_files],
+                key="od_sel_files"
+            )
+            force = st.checkbox("Forzar re-extraccion", key="od_force")
+
+            if st.button(f"Iniciar extraccion — {len(_sel)} archivo(s)",
+                         type="primary", key="btn_od_extract",
+                         disabled=not _sel or not api_key):
+                if not api_key:
+                    st.warning("Configura la API Key en Configuracion.")
+                else:
+                    _selected = [f for f in _od_files if f["name"] in _sel]
+                    _prog = st.progress(0, text="Descargando desde OneDrive...")
+                    _status = st.empty()
+                    _downloaded = []
+                    try:
+                        for i, _f in enumerate(_selected):
+                            _status.caption(f"Descargando {_f['name']}...")
+                            _raw = _od_mgr.download_file(_f["id"])
+                            _downloaded.append((_raw, _f["name"]))
+                            _prog.progress(int((i+1)/len(_selected)*50),
+                                           text=f"Descargado {i+1}/{len(_selected)}")
+                    except Exception as _e:
+                        st.error(f"Error descargando: {_e}")
+                        return
+
+                    class _FakeFile:
+                        def __init__(self, raw, name):
+                            self._raw = raw
+                            self.name = name
+                            self.size = len(raw)
+                        def read(self): return self._raw
+
+                    _fake_files = [_FakeFile(r, n) for r, n in _downloaded]
+                    _prog.progress(50, text="Procesando con IA...")
+                    _run_extraction_local(
+                        _fake_files, api_key, provider, model, max_tokens,
+                        confidence_threshold, ocr_lang, ocr_dpi,
+                        use_easyocr, use_vision_ocr,
+                        campos_sel, tipo_consulta, max_workers,
+                        False, "", "",
+                        project_id=st.session_state.get("_active_project_id",
+                                                         DEFAULT_PROJECT_ID),
+                        user_id=user_id,
+                        force_reprocess=force,
+                    )
+
+    # ── TAB EXPORTAR ─────────────────────────────────────────────────────────
+    with tab_export:
+        st.markdown("Sube los resultados extraidos como archivo Excel a OneDrive.")
+        od_exp_input = st.text_input(
+            "Carpeta de destino en OneDrive",
+            value=_od_export,
+            placeholder="/Extracciones_Clinicas",
+            key="od_export_input"
+        )
+        results = st.session_state.get("results", [])
+        done_count = sum(1 for r in results if r.get("_status") == "done")
+        st.caption(f"{done_count} resultado(s) listos para exportar.")
+
+        if st.button("📤 Subir Excel a OneDrive", key="btn_od_upload",
+                     type="primary", disabled=done_count == 0):
+            with st.spinner("Subiendo a OneDrive..."):
+                try:
+                    _url = _od_mgr.write_results_excel(results, campos_sel, od_exp_input)
+                    save_app_config("od_export_folder", od_exp_input,
+                                    user_payload.get("sub","admin"))
+                    st.success("Archivo subido exitosamente.")
+                    if _url:
+                        st.markdown(f"[Abrir en OneDrive]({_url})")
+                except Exception as _e:
+                    st.error(f"Error: {_e}")
+
+
 def _page_help(st):
     """Página: manual de usuario integrado en la app."""
 
@@ -8058,6 +9013,20 @@ def run_streamlit():
             _page_admin(st, user_payload)
         else:
             st.error("Acceso restringido al administrador.")
+
+    elif page == "gdrive":
+        st.title("📂 Google Drive")
+        _page_gdrive(st, user_payload, api_key, provider, model, max_tokens,
+                     confidence_threshold, ocr_lang, ocr_dpi, use_easyocr,
+                     use_vision_ocr, campos_sel, tipo_consulta, max_workers,
+                     sheets_enabled, sheets_url, creds_path, user_id)
+
+    elif page == "onedrive":
+        st.title("🔷 OneDrive / Microsoft 365")
+        _page_onedrive(st, user_payload, api_key, provider, model, max_tokens,
+                       confidence_threshold, ocr_lang, ocr_dpi, use_easyocr,
+                       use_vision_ocr, campos_sel, tipo_consulta, max_workers,
+                       user_id)
 
     elif page == "help":
         st.title("📖 Manual de usuario")
