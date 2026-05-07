@@ -3430,8 +3430,9 @@ class GoogleSheetsManager:
         import gspread
         from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build as _build
+        import requests as _requests
 
-        scopes = [
+        SCOPES = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
@@ -3439,43 +3440,70 @@ class GoogleSheetsManager:
         # ── 1. Cargar credenciales ────────────────────────────────────────
         cred_data = self._load_credentials_data(self.credentials_path)
         service_account_email = cred_data.get("client_email", "")
-        creds = Credentials.from_service_account_info(cred_data, scopes=scopes)
+        project_id = cred_data.get("project_id", "")
+        log.info(f"Conectando Sheets con cuenta: {service_account_email}")
 
-        # ── 2. Conectar gspread (método más directo y compatible) ─────────
-        # service_account_from_dict funciona en gspread 5.x y 6.x
-        self.gc = gspread.service_account_from_dict(cred_data)
+        # ── 2. Un solo objeto de credenciales para todo ───────────────────
+        creds = Credentials.from_service_account_info(cred_data, scopes=SCOPES)
 
-        # ── 3. Extraer ID del spreadsheet ─────────────────────────────────
+        # ── 3. Verificar que la API de Sheets está habilitada ─────────────
+        try:
+            _test_url = (
+                "https://sheets.googleapis.com/v4/spreadsheets"
+                "?key=invalid&prettyPrint=false"
+            )
+            # Solo chequea conectividad — un 400 significa que la API existe
+            _r = _requests.get(_test_url, timeout=5)
+            if _r.status_code == 403:
+                raise RuntimeError(
+                    f"La API de Google Sheets NO está habilitada en el proyecto "
+                    f"'{project_id}'. Ve a console.cloud.google.com → APIs y servicios "
+                    f"→ Biblioteca → busca 'Google Sheets API' → Habilitar."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # Error de red o similar, continuar
+
+        # ── 4. Conectar gspread con las credenciales ya construidas ───────
+        self.gc = gspread.Client(auth=creds)
+
+        # ── 5. Extraer ID del spreadsheet ─────────────────────────────────
         sheet_id = self._extract_sheet_id(self.spreadsheet_url)
+        log.info(f"Sheet ID: {sheet_id}")
 
-        # ── 4. Auto-compartir usando Drive API ────────────────────────────
+        # ── 6. Auto-compartir usando Drive API ────────────────────────────
         if service_account_email:
             try:
                 drive_svc = _build("drive", "v3", credentials=creds,
                                    cache_discovery=False)
-                self._auto_share_sheet(drive_svc, sheet_id, service_account_email)
+                share_result = self._auto_share_sheet(
+                    drive_svc, sheet_id, service_account_email
+                )
+                log.info(f"Share result: {share_result.get('status')}")
             except Exception as _e:
                 log.warning(f"Auto-share omitido: {_e}")
 
-        # ── 5. Abrir el spreadsheet ───────────────────────────────────────
+        # ── 7. Abrir el spreadsheet con diagnóstico detallado ─────────────
         try:
             self.spreadsheet = self.gc.open_by_key(sheet_id)
-        except gspread.exceptions.APIError as api_err:
-            err_str = str(api_err)
-            if "403" in err_str or "PERMISSION_DENIED" in err_str:
-                raise PermissionError(
-                    f"Sin acceso al spreadsheet. "
-                    f"Compártelo manualmente con: {service_account_email} (rol Editor)."
-                ) from api_err
-            elif "404" in err_str:
-                raise ValueError(
-                    "Spreadsheet no encontrado. Verifica que la URL sea correcta."
-                ) from api_err
-            raise
         except Exception as _e2:
-            raise RuntimeError(f"No se pudo abrir el spreadsheet: {_e2}") from _e2
+            err_str = str(_e2)
+            # Diagnóstico según código de error
+            if "404" in err_str or "SpreadsheetNotFound" in err_str:
+                _msg = ("404 - Posibles causas: "
+                        "1. Sheet no compartido con " + service_account_email + " (Google Sheets > Compartir). "
+                        "2. API de Sheets no habilitada en proyecto " + project_id + " "
+                        "(console.cloud.google.com > APIs > Biblioteca > Google Sheets API > Habilitar). "
+                        "3. URL incorrecta, ID: " + sheet_id)
+                raise RuntimeError(_msg) from _e2
+            elif "403" in err_str or "PERMISSION_DENIED" in err_str:
+                raise RuntimeError("403 - Sin permiso. Comparte con " + service_account_email + " rol Editor.") from _e2
+            else:
+                raise RuntimeError("Error Sheets: " + err_str) from _e2
+                raise RuntimeError(f"Error al abrir Sheets: {err_str}") from _e2
 
-        # ── 6. Crear/obtener hojas ────────────────────────────────────────
+        # ── 8. Crear/obtener hojas ────────────────────────────────────────
         self.ws_data    = self._get_or_create_sheet("Extracciones")
         self.ws_review  = self._get_or_create_sheet("Revisar_Manual")
         self.ws_alerts  = self._get_or_create_sheet("Alertas_Medicas")
