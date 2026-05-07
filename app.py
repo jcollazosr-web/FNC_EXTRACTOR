@@ -3268,9 +3268,9 @@ class GoogleSheetsManager:
     Acumula filas en buffer y las escribe de una sola vez.
     """
  
-    def __init__(self, credentials_path: str, spreadsheet_url: str):
+    def __init__(self, spreadsheet_url: str, credentials_path: str = ""):
+        self.spreadsheet_url  = spreadsheet_url
         self.credentials_path = credentials_path
-        self.spreadsheet_url = spreadsheet_url
         self.gc = None
         self.spreadsheet = None
         self.ws_data    = None
