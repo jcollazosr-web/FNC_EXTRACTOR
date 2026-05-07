@@ -3142,11 +3142,61 @@ class OneDriveManager:
     def set_token(self, token: str):
         self._access_token = token
 
+    def refresh_access_token(self, refresh_token: str) -> str:
+        """
+        Renueva el access_token usando el refresh_token (sin interacción del usuario).
+        Funciona para cuentas personales y organizacionales con Device Flow.
+        Devuelve el nuevo access_token.
+        """
+        import requests as _req
+        url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        scopes = " ".join(self.SCOPES_PERSONAL if self.tenant_id == "consumers"
+                          else self.SCOPES_ORG)
+        data = {
+            "client_id":     self.client_id,
+            "refresh_token": refresh_token,
+            "grant_type":    "refresh_token",
+            "scope":         scopes,
+        }
+        if self.client_secret:
+            data["client_secret"] = self.client_secret
+        resp = _req.post(url, data=data, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+        self._access_token = result["access_token"]
+        return result  # incluye nuevo refresh_token si lo hay
+
     def _headers(self) -> dict:
         if not self._access_token:
-            raise RuntimeError("OneDrive: no hay token de acceso. Autentícate primero.")
+            raise RuntimeError("OneDrive: no hay token. Ve a Configuracion > OneDrive.")
         return {"Authorization": f"Bearer {self._access_token}",
                 "Content-Type": "application/json"}
+
+    def _request(self, method: str, url: str, **kwargs):
+        """
+        Ejecuta una petición HTTP. Si recibe 401, intenta renovar el token
+        automáticamente usando el refresh_token guardado en DB.
+        """
+        import requests as _req
+        resp = _req.request(method, url, headers=self._headers(), **kwargs)
+        if resp.status_code == 401:
+            # Intentar refresh automático
+            _refresh = load_app_config("od_refresh_token", "")
+            if _refresh:
+                try:
+                    _new = self.refresh_access_token(_refresh)
+                    # Guardar nuevo access_token (y refresh_token si cambió)
+                    save_app_config("od_access_token", self._access_token,
+                                    updated_by="auto_refresh")
+                    if _new.get("refresh_token"):
+                        save_app_config("od_refresh_token", _new["refresh_token"],
+                                        updated_by="auto_refresh")
+                    # Reintentar la petición
+                    resp = _req.request(method, url, headers=self._headers(), **kwargs)
+                    log.info("✅ OneDrive token renovado automáticamente")
+                except Exception as _re:
+                    log.warning(f"No se pudo renovar token OneDrive: {_re}")
+        return resp
 
     # ── Listar y descargar archivos ───────────────────────────────────────
 
@@ -3167,9 +3217,9 @@ class OneDriveManager:
 
         files, next_link = [], url
         while next_link:
-            resp = _req.get(next_link, headers=self._headers(),
-                            params={"$top": 100, "$select":
-                                    "id,name,size,webUrl,file,lastModifiedDateTime"})
+            resp = self._request("GET", next_link,
+                                 params={"$top": 100, "$select":
+                                         "id,name,size,webUrl,file,lastModifiedDateTime"})
             resp.raise_for_status()
             data = resp.json()
             for item in data.get("value", []):
@@ -3191,7 +3241,7 @@ class OneDriveManager:
         """Descarga el contenido binario de un archivo de OneDrive."""
         import requests as _req
         url = f"{self.GRAPH_BASE}/me/drive/items/{file_id}/content"
-        resp = _req.get(url, headers=self._headers(), allow_redirects=True)
+        resp = self._request("GET", url, allow_redirects=True)
         resp.raise_for_status()
         return resp.content
 
@@ -3912,7 +3962,7 @@ def _vision_ocr(img_bytes: bytes, api_key: str,
             import anthropic
             client = anthropic.Anthropic(api_key=api_key)
             msg = client.messages.create(
-                model="claude-opus-4-5",
+                model="claude-opus-4-6",
                 max_tokens=4096,
                 messages=[{
                     "role": "user",
@@ -4110,7 +4160,7 @@ def get_relevant_fragment(text: str, campo: str, segments: Dict[str, str],
  
 def _call_llm(messages: List[Dict], api_key: str,
               provider: str = "claude",
-              model: str = "claude-sonnet-4-5",
+              model: str = "claude-sonnet-4-6",
               max_tokens: int = 3000,
               temperature: float = 0.05) -> str:
     """
@@ -4183,7 +4233,7 @@ def _get_openai_client(api_key: str):
 
 
 def _call_claude(messages: List[Dict], api_key: str,
-                 model: str = "claude-sonnet-4-5",
+                 model: str = "claude-sonnet-4-6",
                  max_tokens: int = 3000,
                  temperature: float = 0.05) -> str:
     try:
@@ -5517,7 +5567,7 @@ class ClinicalAuditor:
     """
 
     def __init__(self, api_key: str, provider: str = "claude",
-                 model: str = "claude-sonnet-4-5", max_tokens: int = 2000):
+                 model: str = "claude-sonnet-4-6", max_tokens: int = 2000):
         self.api_key = api_key
         self.provider = provider
         self.model = model
@@ -5867,7 +5917,7 @@ class ClinicalExtractor:
  
     def __init__(self, api_key: str,
                  provider: str = "claude",
-                 model: str = "claude-sonnet-4-5",
+                 model: str = "claude-sonnet-4-6",
                  max_tokens: int = 3000,
                  ocr_lang: str = "spa+eng",
                  ocr_dpi: int = 300,
@@ -6567,10 +6617,25 @@ def _sidebar_nav(st, active_page: str, user_role: str, results: list) -> str:
 
     with st.sidebar:
         st.markdown("### 🏥 Clinical Extractor")
-        st.caption("v13 · SGSSS Colombia")
+        st.caption("v15 · SGSSS Colombia")
+
+        # ── Indicadores de estado de integraciones ────────────────────
+        _sh_url  = (load_app_config("GOOGLE_SHEET_URL","") or
+                    os.environ.get("GOOGLE_SHEET_URL",""))
+        _od_tok  = load_app_config("od_access_token","")
+        _api_key = (load_app_config("ANTHROPIC_API_KEY","") or
+                    os.environ.get("ANTHROPIC_API_KEY","") or
+                    load_app_config("OPENAI_API_KEY","") or
+                    os.environ.get("OPENAI_API_KEY",""))
+        _status_parts = []
+        _status_parts.append("🟢 IA" if _api_key else "🔴 IA")
+        _status_parts.append("🟢 Sheets" if _sh_url else "⚪ Sheets")
+        _status_parts.append("🟢 OneDrive" if _od_tok else "⚪ OneDrive")
+        st.caption("  ".join(_status_parts))
         st.markdown("---")
 
         pages_main = [
+            ("📊  Dashboard",           "dashboard"),
             ("📤  Subir documentos",    "upload"),
             ("☁️  Salesforce",          "salesforce"),
             ("📋  Resultados",          "results"),
@@ -7042,6 +7107,49 @@ def _page_results(st, results, campos_sel, user_payload):
                 mime="application/json", use_container_width=True,
             )
 
+        # Fila 2 de exportación — Excel y búsqueda
+        ex_c1, ex_c2 = st.columns(2)
+        with ex_c1:
+            if st.button("📥 Preparar Excel (.xlsx)", key="prep_xlsx"):
+                import io as _io
+                _rows = []
+                for r in filtered:
+                    if r.get("_status") != "done":
+                        continue
+                    row = {
+                        "Archivo":    r.get("_filename",""),
+                        "Confianza":  f"{r.get('_confidence',0):.0%}",
+                        "A revisar":  "Sí" if r.get("_needs_review") else "No",
+                        "Tipo":       r.get("_tipo_consulta",""),
+                    }
+                    for c in campos_sel:
+                        v = r.get(c,"")
+                        row[c] = " | ".join(str(x) for x in v) if isinstance(v,list) else str(v) if v else ""
+                    _rows.append(row)
+                if _rows:
+                    _buf = _io.BytesIO()
+                    pd.DataFrame(_rows).to_excel(_buf, index=False, sheet_name="Extracciones", engine="openpyxl")
+                    _buf.seek(0)
+                    st.session_state["_xlsx_data"] = _buf.getvalue()
+            if st.session_state.get("_xlsx_data"):
+                st.download_button(
+                    "⬇️ Descargar Excel",
+                    st.session_state["_xlsx_data"],
+                    f"extraccion_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+        with ex_c2:
+            _search_term = st.text_input("🔍 Filtrar resultados",
+                                          placeholder="Buscar en cualquier campo...",
+                                          key="res_search", label_visibility="collapsed")
+            if _search_term:
+                _term = _search_term.lower()
+                filtered = [r for r in filtered
+                            if any(_term in str(v).lower()
+                                   for v in r.values() if v)]
+                st.caption(f"{len(filtered)} resultado(s) que coinciden")
+
     # Tabla principal
     if filtered:
         display_cols = ["_filename","_status","_confidence","_needs_review","_tipo_consulta"] + campos_sel[:6]
@@ -7427,7 +7535,7 @@ def _page_settings(st, user_payload):
     # ── Pre-cargar valores guardados del .env ─────────────────────────────────
     _saved = _load_or_create_config()
     _def_provider    = _saved.get("CEP_PROVIDER", "claude")
-    _def_model_claude = _saved.get("CEP_MODEL", "claude-sonnet-4-5") if _def_provider == "claude" else "claude-sonnet-4-5"
+    _def_model_claude = _saved.get("CEP_MODEL", "claude-sonnet-4-6") if _def_provider == "claude" else "claude-sonnet-4-6"
     _def_model_openai = _saved.get("CEP_MODEL", "gpt-4o") if _def_provider == "openai" else "gpt-4o"
     _def_api_key     = (_saved.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY","")
                         if _def_provider == "claude"
@@ -7459,7 +7567,7 @@ def _page_settings(st, user_payload):
             api_key = pc2.text_input("API Key", type="password",
                                       value=_def_api_key if _def_provider=="claude" else os.environ.get("ANTHROPIC_API_KEY",""),
                                       key="cfg_apikey", disabled=_ro)
-            _mdl_opts_c = ["claude-sonnet-4-5","claude-opus-4-5","claude-haiku-4-5"]
+            _mdl_opts_c = ["claude-sonnet-4-6","claude-opus-4-6","claude-haiku-4-5-20251001"]
             _mdl_idx_c  = _mdl_opts_c.index(_def_model_claude) if _def_model_claude in _mdl_opts_c else 0
             model   = st.selectbox("Modelo", _mdl_opts_c, index=_mdl_idx_c, key="cfg_model", disabled=_ro)
         else:
@@ -7991,6 +8099,13 @@ def _page_settings(st, user_payload):
                                                 _result["access_token"],
                                                 user_payload.get("sub","admin")
                                             )
+                                            # Guardar refresh_token para renovación automática
+                                            if _result.get("refresh_token"):
+                                                save_app_config(
+                                                    "od_refresh_token",
+                                                    _result["refresh_token"],
+                                                    user_payload.get("sub","admin")
+                                                )
                                             for _k, _v in [
                                                 ("od_client_id",
                                                  st.session_state["_od_client_id"]),
@@ -8887,6 +9002,286 @@ def _page_onedrive(st, user_payload, api_key, provider, model, max_tokens,
                     st.error(f"Error: {_e}")
 
 
+def _page_dashboard(st, results, user_payload):
+    """Pagina: dashboard general de estado de la aplicacion."""
+    import sqlite3 as _sq
+
+    # ── Recopilar datos ──────────────────────────────────────────────────────
+    done_r   = [r for r in results if r.get("_status") == "done"]
+    err_r    = [r for r in results if "error" in r.get("_status","")]
+    rev_r    = [r for r in results if r.get("_needs_review")]
+    total    = len(results)
+    done     = len(done_r)
+    errors   = len(err_r)
+    to_rev   = len(rev_r)
+    avg_conf = sum(r.get("_confidence",0) for r in done_r) / max(done,1)
+
+    # Cola de trabajos
+    try:
+        _qs = queue_stats()
+        q_pending  = _qs.get("pending",  0)
+        q_proc     = _qs.get("processing", 0)
+        q_done     = _qs.get("done",     0)
+        q_failed   = _qs.get("failed",   0)
+    except Exception:
+        q_pending = q_proc = q_done = q_failed = 0
+
+    # Proyectos
+    try:
+        projects = get_all_projects()
+        n_projects = len(projects)
+    except Exception:
+        n_projects = 0
+
+    # Snapshots de monitoreo
+    try:
+        _con = _get_db_connection()
+        _snaps = _con.execute(
+            "SELECT avg_conf, error_rate, created_at FROM monitor_snapshots "
+            "ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        snap_data = [dict(s) for s in _snaps] if _snaps else []
+    except Exception:
+        snap_data = []
+
+    # Campo stats top conflictos
+    try:
+        _con2 = _get_db_connection()
+        _cs = _con2.execute(
+            "SELECT campo, total_extractions, "
+            "ROUND(suma_confianza/MAX(total_extractions,1)*100,1) AS conf_pct, "
+            "ROUND(CAST(total_conflicts AS REAL)/MAX(total_extractions,1)*100,1) AS conflicto_pct "
+            "FROM campo_stats ORDER BY conflicto_pct DESC LIMIT 8"
+        ).fetchall()
+        campo_data = [dict(c) for c in _cs] if _cs else []
+    except Exception:
+        campo_data = []
+
+    # Integraciones activas
+    _sh_url = load_app_config("GOOGLE_SHEET_URL","") or os.environ.get("GOOGLE_SHEET_URL","")
+    _od_tok = load_app_config("od_access_token","")
+    _gd_url = load_app_config("gdrive_folder_url","")
+    _api_k  = (load_app_config("ANTHROPIC_API_KEY","") or os.environ.get("ANTHROPIC_API_KEY","") or
+               load_app_config("OPENAI_API_KEY","") or os.environ.get("OPENAI_API_KEY",""))
+    _sf_usr = load_app_config("SF_USERNAME","") or os.environ.get("SF_USERNAME","")
+    _gcp_j  = load_app_config("gcp_credentials_json","")
+
+    # Confianza por tipo de consulta
+    tipo_conf = {}
+    for r in done_r:
+        t = r.get("_tipo_consulta","General") or "General"
+        tipo_conf.setdefault(t, []).append(r.get("_confidence",0))
+    tipo_avg = {t: sum(v)/len(v) for t,v in tipo_conf.items()}
+
+    # ── Renderizar dashboard con HTML/JS ─────────────────────────────────────
+    conf_pct    = int(avg_conf * 100)
+    err_pct     = int(errors / max(total,1) * 100)
+    rev_pct     = int(to_rev / max(done,1) * 100)
+
+    # Datos para gráfica de confianza histórica
+    snap_labels = [s["created_at"][:10] for s in reversed(snap_data)] if snap_data else []
+    snap_conf   = [round(s["avg_conf"]*100,1) for s in reversed(snap_data)] if snap_data else []
+    snap_err    = [round(s["error_rate"]*100,1) for s in reversed(snap_data)] if snap_data else []
+
+    # Datos para gráfica de campos
+    campo_labels  = [c["campo"][:18] for c in campo_data]
+    campo_conf    = [c["conf_pct"] for c in campo_data]
+    campo_conflict= [c["conflicto_pct"] for c in campo_data]
+
+    # Datos para gráfica de tipos de consulta
+    tipo_labels = list(tipo_avg.keys())[:6]
+    tipo_values = [round(tipo_avg[t]*100,1) for t in tipo_labels]
+
+    import json as _json
+
+    html = f"""
+<h2 class="sr-only">Dashboard de estado de Clinical Extractor Pro</h2>
+
+<style>
+.dash-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:1.5rem}}
+.dash-card{{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:.85rem 1rem}}
+.dash-label{{font-size:12px;color:var(--color-text-secondary);margin:0 0 4px}}
+.dash-val{{font-size:22px;font-weight:500;color:var(--color-text-primary);margin:0}}
+.dash-sub{{font-size:11px;color:var(--color-text-tertiary);margin:2px 0 0}}
+.section-title{{font-size:13px;font-weight:500;color:var(--color-text-secondary);
+  text-transform:uppercase;letter-spacing:.04em;margin:1.5rem 0 .6rem}}
+.integ-row{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:1.2rem}}
+.integ-pill{{display:inline-flex;align-items:center;gap:5px;font-size:12px;
+  padding:4px 10px;border-radius:99px;border:0.5px solid var(--color-border-tertiary)}}
+.integ-pill.on{{background:var(--color-background-success);color:var(--color-text-success);
+  border-color:var(--color-border-success)}}
+.integ-pill.off{{background:var(--color-background-secondary);color:var(--color-text-tertiary)}}
+.alert-box{{background:var(--color-background-warning);border:0.5px solid var(--color-border-warning);
+  border-radius:var(--border-radius-md);padding:.6rem 1rem;font-size:13px;
+  color:var(--color-text-warning);margin-bottom:.5rem}}
+.ok-box{{background:var(--color-background-success);border:0.5px solid var(--color-border-success);
+  border-radius:var(--border-radius-md);padding:.6rem 1rem;font-size:13px;
+  color:var(--color-text-success);margin-bottom:.5rem}}
+.chart-wrap{{position:relative;width:100%;margin-bottom:1.5rem}}
+</style>
+
+<div class="section-title">resumen de sesión</div>
+<div class="dash-grid">
+  <div class="dash-card">
+    <p class="dash-label">Total procesados</p>
+    <p class="dash-val">{total}</p>
+    <p class="dash-sub">{n_projects} proyecto(s)</p>
+  </div>
+  <div class="dash-card">
+    <p class="dash-label">Exitosos</p>
+    <p class="dash-val" style="color:var(--color-text-success)">{done}</p>
+    <p class="dash-sub">{100-err_pct}% tasa de éxito</p>
+  </div>
+  <div class="dash-card">
+    <p class="dash-label">Confianza prom.</p>
+    <p class="dash-val" style="color:{'var(--color-text-success)' if conf_pct>=75 else 'var(--color-text-warning)' if conf_pct>=50 else 'var(--color-text-danger)'}">{conf_pct}%</p>
+    <p class="dash-sub">umbral: 75%</p>
+  </div>
+  <div class="dash-card">
+    <p class="dash-label">A revisar</p>
+    <p class="dash-val" style="color:var(--color-text-{'warning' if to_rev>0 else 'secondary'})">{to_rev}</p>
+    <p class="dash-sub">{rev_pct}% del total</p>
+  </div>
+  <div class="dash-card">
+    <p class="dash-label">Errores</p>
+    <p class="dash-val" style="color:var(--color-text-{'danger' if errors>0 else 'secondary'})">{errors}</p>
+    <p class="dash-sub">{err_pct}% tasa error</p>
+  </div>
+  <div class="dash-card">
+    <p class="dash-label">Cola trabajos</p>
+    <p class="dash-val">{q_pending + q_proc}</p>
+    <p class="dash-sub">{q_done} completados · {q_failed} fallidos</p>
+  </div>
+</div>
+
+<div class="section-title">estado de integraciones</div>
+<div class="integ-row">
+  <span class="integ-pill {'on' if _api_k else 'off'}">
+    <i class="ti ti-{'check' if _api_k else 'x'}" aria-hidden="true"></i>
+    IA {'activa' if _api_k else 'sin configurar'}
+  </span>
+  <span class="integ-pill {'on' if _sh_url and _gcp_j else 'off'}">
+    <i class="ti ti-{'check' if _sh_url and _gcp_j else 'x'}" aria-hidden="true"></i>
+    Google Sheets {'conectado' if _sh_url and _gcp_j else 'sin configurar'}
+  </span>
+  <span class="integ-pill {'on' if _gd_url and _gcp_j else 'off'}">
+    <i class="ti ti-{'check' if _gd_url and _gcp_j else 'x'}" aria-hidden="true"></i>
+    Google Drive {'conectado' if _gd_url and _gcp_j else 'sin configurar'}
+  </span>
+  <span class="integ-pill {'on' if _od_tok else 'off'}">
+    <i class="ti ti-{'check' if _od_tok else 'x'}" aria-hidden="true"></i>
+    OneDrive {'autenticado' if _od_tok else 'sin configurar'}
+  </span>
+  <span class="integ-pill {'on' if _sf_usr else 'off'}">
+    <i class="ti ti-{'check' if _sf_usr else 'x'}" aria-hidden="true"></i>
+    Salesforce {'configurado' if _sf_usr else 'sin configurar'}
+  </span>
+</div>
+
+{''.join(f'<div class="alert-box"><i class="ti ti-alert-triangle" aria-hidden="true"></i> ' + a + '</div>' for a in (snap_data[0].get("alerts_fired") or [] if snap_data else [])) if snap_data and snap_data[0].get("alerts_fired") else '<div class="ok-box"><i class="ti ti-circle-check" aria-hidden="true"></i> Sin alertas activas — todos los umbrales dentro de rango normal</div>'}
+
+{'<div class="section-title">confianza y errores históricos</div><div class="chart-wrap" style="height:200px"><canvas id="snapChart" role="img" aria-label="Gráfica de confianza promedio histórica">Sin datos históricos</canvas></div>' if snap_data else ''}
+
+{'<div class="section-title">confianza por campo clínico</div><div class="chart-wrap" style="height:' + str(max(180, len(campo_data)*36+60)) + 'px"><canvas id="campoChart" role="img" aria-label="Confianza por campo clínico">Sin datos de campos</canvas></div>' if campo_data else ''}
+
+{'<div class="section-title">distribución por tipo de consulta</div><div class="chart-wrap" style="height:220px"><canvas id="tipoChart" role="img" aria-label="Confianza por tipo de consulta">Sin datos por tipo</canvas></div>' if tipo_labels else ''}
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const isDark = matchMedia('(prefers-color-scheme: dark)').matches;
+const gridC  = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
+const textC  = isDark ? '#aaa' : '#666';
+const baseOpts = {{
+  responsive: true, maintainAspectRatio: false,
+  plugins: {{ legend: {{ display: false }} }},
+  scales: {{ x: {{ ticks: {{ color: textC, font: {{ size: 11 }} }}, grid: {{ color: gridC }} }},
+             y: {{ ticks: {{ color: textC, font: {{ size: 11 }} }}, grid: {{ color: gridC }} }} }}
+}};
+
+const snapLabels  = {_json.dumps(snap_labels)};
+const snapConf    = {_json.dumps(snap_conf)};
+const snapErr     = {_json.dumps(snap_err)};
+const campoLabels = {_json.dumps(campo_labels)};
+const campoConf   = {_json.dumps(campo_conf)};
+const campoCflt   = {_json.dumps(campo_conflict)};
+const tipoLabels  = {_json.dumps(tipo_labels)};
+const tipoVals    = {_json.dumps(tipo_values)};
+
+if(snapLabels.length && document.getElementById('snapChart')){{
+  new Chart(document.getElementById('snapChart'), {{
+    type: 'line',
+    data: {{
+      labels: snapLabels,
+      datasets: [
+        {{ label:'Confianza %', data: snapConf, borderColor:'#1D9E75',
+           backgroundColor:'rgba(29,158,117,0.12)', tension:0.3, pointRadius:3,
+           borderDash:[] }},
+        {{ label:'Error %', data: snapErr, borderColor:'#E24B4A',
+           backgroundColor:'rgba(226,75,74,0.10)', tension:0.3, pointRadius:3,
+           borderDash:[4,3] }}
+      ]
+    }},
+    options: {{...baseOpts,
+      plugins: {{ legend: {{ display: true, position:'top',
+        labels: {{ color: textC, font: {{ size: 11 }}, boxWidth: 10, padding: 12 }} }} }},
+      scales: {{ ...baseOpts.scales,
+        y: {{ ...baseOpts.scales.y, min:0, max:100,
+              ticks: {{ ...baseOpts.scales.y.ticks, callback: v => v+'%' }} }} }}
+    }}
+  }});
+}}
+
+if(campoLabels.length && document.getElementById('campoChart')){{
+  new Chart(document.getElementById('campoChart'), {{
+    type: 'bar',
+    data: {{
+      labels: campoLabels,
+      datasets: [
+        {{ label:'Confianza %', data: campoConf, backgroundColor:'rgba(29,158,117,0.75)',
+           borderColor:'#1D9E75', borderWidth:1 }},
+        {{ label:'Conflicto %', data: campoCflt, backgroundColor:'rgba(226,75,74,0.65)',
+           borderColor:'#E24B4A', borderWidth:1 }}
+      ]
+    }},
+    options: {{...baseOpts,
+      indexAxis:'y',
+      plugins: {{ legend: {{ display: true, position:'top',
+        labels: {{ color: textC, font: {{ size: 11 }}, boxWidth:10, padding:12 }} }} }},
+      scales: {{
+        x: {{ ...baseOpts.scales.x, min:0, max:100,
+              ticks: {{ ...baseOpts.scales.x.ticks, callback: v => v+'%' }} }},
+        y: {{ ...baseOpts.scales.y, ticks: {{ color: textC, font: {{ size: 11 }} }} }}
+      }}
+    }}
+  }});
+}}
+
+if(tipoLabels.length && document.getElementById('tipoChart')){{
+  const colors = ['#1D9E75','#378ADD','#BA7517','#D4537E','#7F77DD','#639922'];
+  new Chart(document.getElementById('tipoChart'), {{
+    type: 'bar',
+    data: {{
+      labels: tipoLabels,
+      datasets: [{{ label:'Confianza %', data: tipoVals,
+        backgroundColor: tipoLabels.map((_,i) => colors[i % colors.length] + 'CC'),
+        borderColor:      tipoLabels.map((_,i) => colors[i % colors.length]),
+        borderWidth:1 }}]
+    }},
+    options: {{...baseOpts,
+      scales: {{
+        x: {{ ...baseOpts.scales.x,
+              ticks: {{ ...baseOpts.scales.x.ticks, autoSkip:false, maxRotation:30 }} }},
+        y: {{ ...baseOpts.scales.y, min:0, max:100,
+              ticks: {{ ...baseOpts.scales.y.ticks, callback: v => v+'%' }} }}
+      }}
+    }}
+  }});
+}}
+</script>
+"""
+    st.components.v1.html(html, height=900, scrolling=True)
+
+
 def _page_help(st):
     """Página: manual de usuario integrado en la app."""
 
@@ -9061,8 +9456,52 @@ token_uri = "https://oauth2.googleapis.com/token"
 > 💡 **Modo incremental:** procesa solo registros nuevos desde la última ejecución.
 """)
 
-    # ── Sección 12 ──────────────────────────────────────────────────────────
-    with st.expander("12. Seguridad y privacidad"):
+    with st.expander("12. Google Drive"):
+        st.markdown("""
+Conecta una carpeta de Google Drive para **leer documentos** y **exportar resultados**.
+Usa las mismas credenciales JSON de Google Sheets.
+
+**Configuración:**
+1. Ve a ⚙️ Configuración → Google Drive
+2. Activa **Habilitar Google Drive**
+3. Pega la URL de la carpeta de Drive donde están los PDFs
+4. Haz clic en **🔌 Probar conexión** — la app otorga acceso automáticamente
+5. Desde **📂 Google Drive** en el menú, selecciona archivos y procésalos
+
+**Exportar resultados:**
+- En la pestaña **📤 Exportar resultados**, pega la URL de la carpeta de destino
+- Haz clic en **Subir Excel a Drive** — sube un archivo .xlsx con todos los resultados
+""")
+
+    with st.expander("13. OneDrive / Microsoft 365"):
+        st.markdown("""
+Conecta OneDrive para **leer documentos** y **exportar resultados** a Microsoft 365.
+
+**Paso 1 — Registrar una app en Azure:**
+1. Ve a [portal.azure.com](https://portal.azure.com) → **Azure Active Directory → Registros de aplicaciones**
+2. Haz clic en **Nuevo registro**
+3. Nombre: `Clinical Extractor`, tipo de cuenta: **Cuentas personales y organizacionales**
+4. URI de redirección: deja vacío
+5. Copia el **Application (client) ID** — lo necesitarás en la app
+
+**Paso 2 — Permisos:**
+1. En tu app registrada → **Permisos de API → Agregar permiso**
+2. Microsoft Graph → Permisos delegados → busca `Files.ReadWrite` → Agregar
+3. Haz clic en **Conceder consentimiento de administrador**
+
+**Paso 3 — Configurar en la app:**
+1. Ve a ⚙️ Configuración → OneDrive
+2. Activa **Habilitar OneDrive**
+3. Ingresa el **Client ID** del paso 1
+4. Selecciona el tipo de cuenta (Personal u Organizacional)
+5. Haz clic en **🔑 Iniciar autenticación** → sigue las instrucciones en pantalla
+6. Una vez autenticado, el token se guarda cifrado permanentemente
+
+> 🔄 **Renovación automática:** el token se renueva solo cuando expira, sin necesidad de volver a autenticarse.
+""")
+
+    # ── Sección 14 ──────────────────────────────────────────────────────────
+    with st.expander("14. Seguridad y privacidad"):
         st.markdown("""
 - 🔐 Datos clínicos cifrados con **AES-256** en la base de datos local.
 - 🔐 Comunicaciones con la IA por **HTTPS**.
@@ -9076,7 +9515,7 @@ token_uri = "https://oauth2.googleapis.com/token"
 """)
 
     # ── Sección 13 — FAQ ──────────────────────────────────────────────────
-    with st.expander("13. Preguntas frecuentes"):
+    with st.expander("15. Preguntas frecuentes"):
         faqs = [
             ("¿Por qué algunos campos aparecen en rojo?",
              "La IA no pudo extraer ese dato con suficiente confianza. Corrígelo en **⚠️ Revisar manualmente**."),
@@ -9216,7 +9655,7 @@ def run_streamlit():
 
     api_key              = cfg("cfg_api_key",    os.environ.get("ANTHROPIC_API_KEY",""))
     provider             = cfg("cfg_prov",        "claude")
-    model                = cfg("cfg_mdl",         "claude-sonnet-4-5")
+    model                = cfg("cfg_mdl",         "claude-sonnet-4-6")
     max_tokens           = cfg("cfg_max_tok",     3000)
     confidence_threshold = cfg("cfg_conf_thr",    0.75)
     ocr_lang             = cfg("cfg_lang_ocr",    "spa+eng")
@@ -9238,7 +9677,11 @@ def run_streamlit():
     sf_enabled           = cfg("cfg_sf_en",       False)
 
     # Enrutar a la página activa
-    if page == "upload":
+    if page == "dashboard":
+        st.title("📊 Dashboard")
+        _page_dashboard(st, results, user_payload)
+
+    elif page == "upload":
         st.title("Subir documentos")
         _page_upload(st, user_payload, api_key, provider, model, max_tokens,
                      confidence_threshold, ocr_lang, ocr_dpi, use_easyocr,
@@ -9633,7 +10076,7 @@ class TestTrazabilidad:
             valor="Hipertensión arterial sistémica",
             raw_text=raw_text,
             segments=segments,
-            modelo="claude/claude-sonnet-4-5",
+            modelo="claude/claude-sonnet-4-6",
             confianza=0.95,
             metodo="extraction_literal",
             es_inferencia=False,
