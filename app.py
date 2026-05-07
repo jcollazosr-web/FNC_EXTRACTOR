@@ -6653,24 +6653,8 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
     if _resolved_enabled and _resolved_url:
         try:
             sheets_mgr = GoogleSheetsManager(_resolved_url, creds_path or "")
-        except FileNotFoundError as e:
-            _st.error(f"❌ {e}")
         except Exception as e:
-            _err = str(e)
-            _svc_email = ""
-            try:
-                _raw = load_app_config("gcp_credentials_json", "")
-                if _raw:
-                    import json as _jj
-                    _svc_email = _jj.loads(_raw).get("client_email", "")
-            except Exception:
-                pass
-            if "404" in _err and _svc_email:
-                _st.warning("Sheets sin acceso. Comparte el Sheet con: " + _svc_email + " (rol Editor)")
-            elif "404" in _err:
-                _st.warning("Sheets sin acceso (404). Ve a Configuracion > Google Sheets > Probar conexion.")
-            else:
-                _st.warning("Google Sheets no conectado: " + _err)
+            _st.warning("Sheets no conectado (la extraccion continua): " + str(e))
     enable_anon     = _st.session_state.get("cfg_anon_v",     False)
     enable_ensemble = _st.session_state.get("cfg_ensemble_v", True)
 
