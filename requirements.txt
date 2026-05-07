@@ -1,21 +1,40 @@
-streamlit
-anthropic
-openai
+# ── Interfaz web ──────────────────────────────────────────────
+streamlit>=1.32.0
+
+# ── Modelos de IA ──────────────────────────────────────────────
+anthropic>=0.25.0
+openai>=1.20.0
+
+# ── Configuración ──────────────────────────────────────────────
 python-dotenv
-PyMuPDF
+
+# ── Procesamiento de documentos / OCR ─────────────────────────
+PyMuPDF>=1.23.0
 pytesseract
-Pillow
+Pillow>=10.0.0
 opencv-python-headless
-numpy
-pandas
+numpy>=1.24.0
+easyocr
+
+# ── Datos y exportación ────────────────────────────────────────
+pandas>=2.0.0
 openpyxl
+scikit-learn
+
+# ── Google (Sheets + Drive) ────────────────────────────────────
 google-auth
 google-api-python-client
 gspread
+
+# ── Microsoft OneDrive / Microsoft Graph ──────────────────────
+requests
+msal
+
+# ── Salesforce ─────────────────────────────────────────────────
 simple-salesforce
-tenacity
+
+# ── Seguridad y autenticación ──────────────────────────────────
 bcrypt
 cryptography
 PyJWT
-easyocr
-scikit-learn
+tenacity
