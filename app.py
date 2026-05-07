@@ -2970,7 +2970,8 @@ class GoogleDriveManager:
 
             self._cred_data = GoogleSheetsManager._load_credentials_data(self.credentials_path)
             creds = Credentials.from_service_account_info(self._cred_data, scopes=self.SCOPES)
-            self.service = _build("drive", "v3", credentials=creds)
+            self.service = _build("drive", "v3", credentials=creds,
+                                  cache_discovery=False)
             log.info("✅ Google Drive conectado")
         except Exception as e:
             log.error(f"❌ Google Drive: {e}")
@@ -3426,8 +3427,8 @@ class GoogleSheetsManager:
     def _connect(self):
         try:
             from google.oauth2.service_account import Credentials
-            import gspread
             from googleapiclient.discovery import build as _build
+            import gspread
 
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
@@ -3435,10 +3436,22 @@ class GoogleSheetsManager:
             ]
 
             cred_data = self._load_credentials_data(self.credentials_path)
-            creds = Credentials.from_service_account_info(cred_data, scopes=scopes)
-            self.gc = gspread.authorize(creds)
 
-            # Extraer el ID del spreadsheet (acepta URL completa o ID puro)
+            # ── Autenticar con gspread (compatible gspread 5.x y 6.x) ────
+            creds = Credentials.from_service_account_info(cred_data, scopes=scopes)
+            try:
+                # gspread >= 6.0: usar Client directamente
+                self.gc = gspread.Client(auth=creds)
+                self.gc.session  # fuerza inicialización
+            except Exception:
+                try:
+                    # gspread 5.x: authorize()
+                    self.gc = gspread.authorize(creds)
+                except Exception:
+                    # Último recurso: service_account_from_dict
+                    self.gc = gspread.service_account_from_dict(cred_data)
+
+            # ── Extraer el ID del spreadsheet ────────────────────────────
             sheet_id = self._extract_sheet_id(self.spreadsheet_url)
 
             # ── Auto-compartir con la cuenta de servicio ─────────────────
@@ -3453,6 +3466,14 @@ class GoogleSheetsManager:
             # ── Abrir el spreadsheet ──────────────────────────────────────
             try:
                 self.spreadsheet = self.gc.open_by_key(sheet_id)
+            except gspread.exceptions.APIError as api_err:
+                # Error 403: el sheet no está compartido todavía (auto-share puede haber fallado)
+                if "403" in str(api_err) or "PERMISSION_DENIED" in str(api_err):
+                    raise PermissionError(
+                        f"Sin acceso al spreadsheet. Compártelo manualmente con: "
+                        f"{service_account_email} (rol Editor)."
+                    ) from api_err
+                raise
             except Exception:
                 self.spreadsheet = self.gc.open_by_url(self.spreadsheet_url)
 
@@ -3463,7 +3484,7 @@ class GoogleSheetsManager:
 
             log.info(f"✅ Google Sheets conectado: {self.spreadsheet.title}")
 
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError):
             raise
         except Exception as e:
             log.error(f"❌ Error Google Sheets: {e}")
@@ -6474,11 +6495,9 @@ def _sidebar_nav(st, active_page: str, user_role: str, results: list) -> str:
         st.markdown("---")
 
         pages_main = [
-            ("📤  Subir documentos", "upload"),
-            ("📂  Google Drive",     "gdrive"),
-            ("🔷  OneDrive",         "onedrive"),
-            ("☁️  Salesforce",       "salesforce"),
-            ("📋  Resultados",       "results"),
+            ("📤  Subir documentos",    "upload"),
+            ("☁️  Salesforce",          "salesforce"),
+            ("📋  Resultados",          "results"),
             ("⚠️  Revisar manualmente", "review"),
         ]
         pages_analysis = [
@@ -6488,8 +6507,10 @@ def _sidebar_nav(st, active_page: str, user_role: str, results: list) -> str:
             ("🔁  Duplicados",         "dupes"),
         ]
         pages_system = [
-            ("⚙️  Configuración",       "settings"),
-            ("📖  Ayuda / Manual",       "help"),
+            ("⚙️  Configuración",   "settings"),
+            ("📂  Google Drive",    "gdrive"),
+            ("🔷  OneDrive",        "onedrive"),
+            ("📖  Ayuda / Manual",  "help"),
         ]
         if user_role == Role.ADMIN:
             pages_system.append(("👑  Usuarios y seguridad", "admin"))
@@ -7558,8 +7579,20 @@ def _page_settings(st, user_payload):
                                 ])
                             )
 
+                        except PermissionError as _e:
+                            st.error(f"❌ Sin permisos: {_e}")
                         except Exception as _e:
-                            st.error(f"❌ Error de conexión: {_e}")
+                            _err = str(_e)
+                            st.error(f"❌ Error de conexion: {_err}")
+                            if "credentials" in _err.lower() or "json" in _err.lower():
+                                st.info("💡 Verifica que el JSON este completo y bien pegado.")
+                            elif "404" in _err or "not found" in _err.lower():
+                                st.info("💡 El spreadsheet no existe o la URL es incorrecta.")
+                            elif "403" in _err or "permission" in _err.lower():
+                                st.info("💡 Sin acceso al Sheet. Haz clic en Probar conexion "
+                                        "de nuevo para intentar compartirlo automaticamente.")
+                            elif "quota" in _err.lower():
+                                st.info("💡 Limite de cuota de Google API. Espera unos minutos.")
 
             st.caption("Sincronizacion bidireccional de deduplicacion con Sheets")
 
