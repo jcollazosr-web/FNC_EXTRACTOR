@@ -9094,192 +9094,198 @@ def _page_dashboard(st, results, user_payload):
 
     import json as _json
 
-    html = f"""
-<h2 class="sr-only">Dashboard de estado de Clinical Extractor Pro</h2>
+    # Calcular altura dinámica según secciones presentes
+    _height = 620
+    if snap_data:   _height += 220
+    if campo_data:  _height += max(200, len(campo_data)*40+80)
+    if tipo_labels: _height += 250
 
+    _conf_color  = "#1D9E75" if conf_pct >= 75 else "#BA7517" if conf_pct >= 50 else "#E24B4A"
+    _err_color   = "#E24B4A" if errors > 0 else "#888"
+    _rev_color   = "#BA7517" if to_rev > 0 else "#888"
+    _ia_on   = bool(_api_k)
+    _sh_on   = bool(_sh_url and _gcp_j)
+    _gd_on   = bool(_gd_url and _gcp_j)
+    _od_on   = bool(_od_tok)
+    _sf_on   = bool(_sf_usr)
+
+    def _pill(label, on):
+        bg  = "#0F6E56" if on else "#333"
+        col = "#9FE1CB" if on else "#888"
+        bdr = "#1D9E75" if on else "#555"
+        ico = "&#10003;" if on else "&#8722;"
+        return (f'<span style="display:inline-flex;align-items:center;gap:5px;font-size:12px;'
+                f'padding:4px 12px;border-radius:99px;background:{bg};color:{col};'
+                f'border:1px solid {bdr};margin:3px">{ico} {label}</span>')
+
+    _pills = "".join([
+        _pill("IA", _ia_on),
+        _pill("Google Sheets", _sh_on),
+        _pill("Google Drive", _gd_on),
+        _pill("OneDrive", _od_on),
+        _pill("Salesforce", _sf_on),
+    ])
+
+    _alert_html = ""
+    if snap_data and snap_data[0].get("alerts_fired"):
+        for _a in snap_data[0]["alerts_fired"]:
+            _alert_html += (f'<div style="background:#3d2a00;border:1px solid #BA7517;'
+                            f'border-radius:8px;padding:8px 14px;font-size:13px;'
+                            f'color:#FAC775;margin-bottom:6px">'
+                            f'&#9888; {_a}</div>')
+    else:
+        _alert_html = (f'<div style="background:#04342C;border:1px solid #1D9E75;'
+                       f'border-radius:8px;padding:8px 14px;font-size:13px;'
+                       f'color:#9FE1CB;margin-bottom:6px">'
+                       f'&#10003; Sin alertas activas — todos los umbrales en rango normal</div>')
+
+    _snap_section = ""
+    if snap_data:
+        _snap_section = (
+            '<p style="font-size:11px;font-weight:500;color:#888;text-transform:uppercase;'
+            'letter-spacing:.05em;margin:20px 0 8px">tendencia histórica</p>'
+            '<div style="position:relative;width:100%;height:180px;margin-bottom:20px">'
+            '<canvas id="snapChart" role="img" aria-label="Tendencia histórica de confianza y errores">'
+            'Sin datos</canvas></div>'
+        )
+
+    _campo_section = ""
+    if campo_data:
+        _ch = max(160, len(campo_data)*38+70)
+        _campo_section = (
+            '<p style="font-size:11px;font-weight:500;color:#888;text-transform:uppercase;'
+            'letter-spacing:.05em;margin:20px 0 8px">confianza por campo clínico</p>'
+            f'<div style="position:relative;width:100%;height:{_ch}px;margin-bottom:20px">'
+            '<canvas id="campoChart" role="img" aria-label="Confianza y conflictos por campo">'
+            'Sin datos</canvas></div>'
+        )
+
+    _tipo_section = ""
+    if tipo_labels:
+        _tipo_section = (
+            '<p style="font-size:11px;font-weight:500;color:#888;text-transform:uppercase;'
+            'letter-spacing:.05em;margin:20px 0 8px">confianza por tipo de consulta</p>'
+            '<div style="position:relative;width:100%;height:200px;margin-bottom:20px">'
+            '<canvas id="tipoChart" role="img" aria-label="Confianza por tipo de consulta">'
+            'Sin datos</canvas></div>'
+        )
+
+    html = f"""
 <style>
-.dash-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:1.5rem}}
-.dash-card{{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:.85rem 1rem}}
-.dash-label{{font-size:12px;color:var(--color-text-secondary);margin:0 0 4px}}
-.dash-val{{font-size:22px;font-weight:500;color:var(--color-text-primary);margin:0}}
-.dash-sub{{font-size:11px;color:var(--color-text-tertiary);margin:2px 0 0}}
-.section-title{{font-size:13px;font-weight:500;color:var(--color-text-secondary);
-  text-transform:uppercase;letter-spacing:.04em;margin:1.5rem 0 .6rem}}
-.integ-row{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:1.2rem}}
-.integ-pill{{display:inline-flex;align-items:center;gap:5px;font-size:12px;
-  padding:4px 10px;border-radius:99px;border:0.5px solid var(--color-border-tertiary)}}
-.integ-pill.on{{background:var(--color-background-success);color:var(--color-text-success);
-  border-color:var(--color-border-success)}}
-.integ-pill.off{{background:var(--color-background-secondary);color:var(--color-text-tertiary)}}
-.alert-box{{background:var(--color-background-warning);border:0.5px solid var(--color-border-warning);
-  border-radius:var(--border-radius-md);padding:.6rem 1rem;font-size:13px;
-  color:var(--color-text-warning);margin-bottom:.5rem}}
-.ok-box{{background:var(--color-background-success);border:0.5px solid var(--color-border-success);
-  border-radius:var(--border-radius-md);padding:.6rem 1rem;font-size:13px;
-  color:var(--color-text-success);margin-bottom:.5rem}}
-.chart-wrap{{position:relative;width:100%;margin-bottom:1.5rem}}
+body{{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:transparent;color:#e0e0e0}}
+.g{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px}}
+.c{{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:10px;padding:14px 16px}}
+.lbl{{font-size:11px;color:#888;margin:0 0 5px;text-transform:uppercase;letter-spacing:.04em}}
+.val{{font-size:26px;font-weight:500;margin:0 0 3px;line-height:1}}
+.sub{{font-size:11px;color:#666;margin:0}}
+.sec{{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;
+  letter-spacing:.05em;margin:20px 0 8px}}
 </style>
 
-<div class="section-title">resumen de sesión</div>
-<div class="dash-grid">
-  <div class="dash-card">
-    <p class="dash-label">Total procesados</p>
-    <p class="dash-val">{total}</p>
-    <p class="dash-sub">{n_projects} proyecto(s)</p>
+<p class="sec">resumen de sesión</p>
+<div class="g">
+  <div class="c">
+    <p class="lbl">Total procesados</p>
+    <p class="val" style="color:#e0e0e0">{total}</p>
+    <p class="sub">{n_projects} proyecto(s)</p>
   </div>
-  <div class="dash-card">
-    <p class="dash-label">Exitosos</p>
-    <p class="dash-val" style="color:var(--color-text-success)">{done}</p>
-    <p class="dash-sub">{100-err_pct}% tasa de éxito</p>
+  <div class="c">
+    <p class="lbl">Exitosos</p>
+    <p class="val" style="color:#1D9E75">{done}</p>
+    <p class="sub">{100-err_pct}% tasa de éxito</p>
   </div>
-  <div class="dash-card">
-    <p class="dash-label">Confianza prom.</p>
-    <p class="dash-val" style="color:{'var(--color-text-success)' if conf_pct>=75 else 'var(--color-text-warning)' if conf_pct>=50 else 'var(--color-text-danger)'}">{conf_pct}%</p>
-    <p class="dash-sub">umbral: 75%</p>
+  <div class="c">
+    <p class="lbl">Confianza prom.</p>
+    <p class="val" style="color:{_conf_color}">{conf_pct}%</p>
+    <p class="sub">umbral: 75%</p>
   </div>
-  <div class="dash-card">
-    <p class="dash-label">A revisar</p>
-    <p class="dash-val" style="color:var(--color-text-{'warning' if to_rev>0 else 'secondary'})">{to_rev}</p>
-    <p class="dash-sub">{rev_pct}% del total</p>
+  <div class="c">
+    <p class="lbl">A revisar</p>
+    <p class="val" style="color:{_rev_color}">{to_rev}</p>
+    <p class="sub">{rev_pct}% del total</p>
   </div>
-  <div class="dash-card">
-    <p class="dash-label">Errores</p>
-    <p class="dash-val" style="color:var(--color-text-{'danger' if errors>0 else 'secondary'})">{errors}</p>
-    <p class="dash-sub">{err_pct}% tasa error</p>
+  <div class="c">
+    <p class="lbl">Errores</p>
+    <p class="val" style="color:{_err_color}">{errors}</p>
+    <p class="sub">{err_pct}% tasa error</p>
   </div>
-  <div class="dash-card">
-    <p class="dash-label">Cola trabajos</p>
-    <p class="dash-val">{q_pending + q_proc}</p>
-    <p class="dash-sub">{q_done} completados · {q_failed} fallidos</p>
+  <div class="c">
+    <p class="lbl">Cola trabajos</p>
+    <p class="val" style="color:#e0e0e0">{q_pending + q_proc}</p>
+    <p class="sub">{q_done} completados &middot; {q_failed} fallidos</p>
   </div>
 </div>
 
-<div class="section-title">estado de integraciones</div>
-<div class="integ-row">
-  <span class="integ-pill {'on' if _api_k else 'off'}">
-    <i class="ti ti-{'check' if _api_k else 'x'}" aria-hidden="true"></i>
-    IA {'activa' if _api_k else 'sin configurar'}
-  </span>
-  <span class="integ-pill {'on' if _sh_url and _gcp_j else 'off'}">
-    <i class="ti ti-{'check' if _sh_url and _gcp_j else 'x'}" aria-hidden="true"></i>
-    Google Sheets {'conectado' if _sh_url and _gcp_j else 'sin configurar'}
-  </span>
-  <span class="integ-pill {'on' if _gd_url and _gcp_j else 'off'}">
-    <i class="ti ti-{'check' if _gd_url and _gcp_j else 'x'}" aria-hidden="true"></i>
-    Google Drive {'conectado' if _gd_url and _gcp_j else 'sin configurar'}
-  </span>
-  <span class="integ-pill {'on' if _od_tok else 'off'}">
-    <i class="ti ti-{'check' if _od_tok else 'x'}" aria-hidden="true"></i>
-    OneDrive {'autenticado' if _od_tok else 'sin configurar'}
-  </span>
-  <span class="integ-pill {'on' if _sf_usr else 'off'}">
-    <i class="ti ti-{'check' if _sf_usr else 'x'}" aria-hidden="true"></i>
-    Salesforce {'configurado' if _sf_usr else 'sin configurar'}
-  </span>
-</div>
+<p class="sec">integraciones</p>
+<div style="margin-bottom:16px">{_pills}</div>
 
-{''.join(f'<div class="alert-box"><i class="ti ti-alert-triangle" aria-hidden="true"></i> ' + a + '</div>' for a in (snap_data[0].get("alerts_fired") or [] if snap_data else [])) if snap_data and snap_data[0].get("alerts_fired") else '<div class="ok-box"><i class="ti ti-circle-check" aria-hidden="true"></i> Sin alertas activas — todos los umbrales dentro de rango normal</div>'}
+<p class="sec">alertas</p>
+{_alert_html}
 
-{'<div class="section-title">confianza y errores históricos</div><div class="chart-wrap" style="height:200px"><canvas id="snapChart" role="img" aria-label="Gráfica de confianza promedio histórica">Sin datos históricos</canvas></div>' if snap_data else ''}
-
-{'<div class="section-title">confianza por campo clínico</div><div class="chart-wrap" style="height:' + str(max(180, len(campo_data)*36+60)) + 'px"><canvas id="campoChart" role="img" aria-label="Confianza por campo clínico">Sin datos de campos</canvas></div>' if campo_data else ''}
-
-{'<div class="section-title">distribución por tipo de consulta</div><div class="chart-wrap" style="height:220px"><canvas id="tipoChart" role="img" aria-label="Confianza por tipo de consulta">Sin datos por tipo</canvas></div>' if tipo_labels else ''}
+{_snap_section}
+{_campo_section}
+{_tipo_section}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-const isDark = matchMedia('(prefers-color-scheme: dark)').matches;
-const gridC  = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
-const textC  = isDark ? '#aaa' : '#666';
-const baseOpts = {{
-  responsive: true, maintainAspectRatio: false,
-  plugins: {{ legend: {{ display: false }} }},
-  scales: {{ x: {{ ticks: {{ color: textC, font: {{ size: 11 }} }}, grid: {{ color: gridC }} }},
-             y: {{ ticks: {{ color: textC, font: {{ size: 11 }} }}, grid: {{ color: gridC }} }} }}
+const gc = 'rgba(255,255,255,0.07)';
+const tc = '#999';
+const base = {{
+  responsive:true, maintainAspectRatio:false,
+  plugins:{{legend:{{display:false}}}},
+  scales:{{
+    x:{{ticks:{{color:tc,font:{{size:11}}}},grid:{{color:gc}}}},
+    y:{{ticks:{{color:tc,font:{{size:11}}}},grid:{{color:gc}}}}
+  }}
 }};
+const sL={_json.dumps(snap_labels)}, sC={_json.dumps(snap_conf)}, sE={_json.dumps(snap_err)};
+const cL={_json.dumps(campo_labels)}, cC={_json.dumps(campo_conf)}, cF={_json.dumps(campo_conflict)};
+const tL={_json.dumps(tipo_labels)}, tV={_json.dumps(tipo_values)};
 
-const snapLabels  = {_json.dumps(snap_labels)};
-const snapConf    = {_json.dumps(snap_conf)};
-const snapErr     = {_json.dumps(snap_err)};
-const campoLabels = {_json.dumps(campo_labels)};
-const campoConf   = {_json.dumps(campo_conf)};
-const campoCflt   = {_json.dumps(campo_conflict)};
-const tipoLabels  = {_json.dumps(tipo_labels)};
-const tipoVals    = {_json.dumps(tipo_values)};
-
-if(snapLabels.length && document.getElementById('snapChart')){{
-  new Chart(document.getElementById('snapChart'), {{
-    type: 'line',
-    data: {{
-      labels: snapLabels,
-      datasets: [
-        {{ label:'Confianza %', data: snapConf, borderColor:'#1D9E75',
-           backgroundColor:'rgba(29,158,117,0.12)', tension:0.3, pointRadius:3,
-           borderDash:[] }},
-        {{ label:'Error %', data: snapErr, borderColor:'#E24B4A',
-           backgroundColor:'rgba(226,75,74,0.10)', tension:0.3, pointRadius:3,
-           borderDash:[4,3] }}
-      ]
-    }},
-    options: {{...baseOpts,
-      plugins: {{ legend: {{ display: true, position:'top',
-        labels: {{ color: textC, font: {{ size: 11 }}, boxWidth: 10, padding: 12 }} }} }},
-      scales: {{ ...baseOpts.scales,
-        y: {{ ...baseOpts.scales.y, min:0, max:100,
-              ticks: {{ ...baseOpts.scales.y.ticks, callback: v => v+'%' }} }} }}
-    }}
-  }});
+if(sL.length && document.getElementById('snapChart')){{
+  new Chart(document.getElementById('snapChart'),{{type:'line',data:{{labels:sL,datasets:[
+    {{label:'Confianza %',data:sC,borderColor:'#1D9E75',backgroundColor:'rgba(29,158,117,0.15)',
+      tension:0.3,pointRadius:3,borderDash:[]}},
+    {{label:'Error %',data:sE,borderColor:'#E24B4A',backgroundColor:'rgba(226,75,74,0.1)',
+      tension:0.3,pointRadius:3,borderDash:[4,3]}}
+  ]}},options:{{...base,
+    plugins:{{legend:{{display:true,position:'top',labels:{{color:tc,font:{{size:11}},boxWidth:10,padding:12}}}}}},
+    scales:{{...base.scales,y:{{...base.scales.y,min:0,max:100,
+      ticks:{{...base.scales.y.ticks,callback:v=>v+'%'}}}}}}
+  }}}});
 }}
 
-if(campoLabels.length && document.getElementById('campoChart')){{
-  new Chart(document.getElementById('campoChart'), {{
-    type: 'bar',
-    data: {{
-      labels: campoLabels,
-      datasets: [
-        {{ label:'Confianza %', data: campoConf, backgroundColor:'rgba(29,158,117,0.75)',
-           borderColor:'#1D9E75', borderWidth:1 }},
-        {{ label:'Conflicto %', data: campoCflt, backgroundColor:'rgba(226,75,74,0.65)',
-           borderColor:'#E24B4A', borderWidth:1 }}
-      ]
-    }},
-    options: {{...baseOpts,
-      indexAxis:'y',
-      plugins: {{ legend: {{ display: true, position:'top',
-        labels: {{ color: textC, font: {{ size: 11 }}, boxWidth:10, padding:12 }} }} }},
-      scales: {{
-        x: {{ ...baseOpts.scales.x, min:0, max:100,
-              ticks: {{ ...baseOpts.scales.x.ticks, callback: v => v+'%' }} }},
-        y: {{ ...baseOpts.scales.y, ticks: {{ color: textC, font: {{ size: 11 }} }} }}
-      }}
+if(cL.length && document.getElementById('campoChart')){{
+  new Chart(document.getElementById('campoChart'),{{type:'bar',data:{{labels:cL,datasets:[
+    {{label:'Confianza %',data:cC,backgroundColor:'rgba(29,158,117,0.8)',borderColor:'#1D9E75',borderWidth:1}},
+    {{label:'Conflicto %',data:cF,backgroundColor:'rgba(226,75,74,0.7)',borderColor:'#E24B4A',borderWidth:1}}
+  ]}},options:{{...base,indexAxis:'y',
+    plugins:{{legend:{{display:true,position:'top',labels:{{color:tc,font:{{size:11}},boxWidth:10,padding:12}}}}}},
+    scales:{{
+      x:{{...base.scales.x,min:0,max:100,ticks:{{...base.scales.x.ticks,callback:v=>v+'%'}}}},
+      y:{{...base.scales.y,ticks:{{color:tc,font:{{size:11}}}}}}
     }}
-  }});
+  }}}});
 }}
 
-if(tipoLabels.length && document.getElementById('tipoChart')){{
-  const colors = ['#1D9E75','#378ADD','#BA7517','#D4537E','#7F77DD','#639922'];
-  new Chart(document.getElementById('tipoChart'), {{
-    type: 'bar',
-    data: {{
-      labels: tipoLabels,
-      datasets: [{{ label:'Confianza %', data: tipoVals,
-        backgroundColor: tipoLabels.map((_,i) => colors[i % colors.length] + 'CC'),
-        borderColor:      tipoLabels.map((_,i) => colors[i % colors.length]),
-        borderWidth:1 }}]
-    }},
-    options: {{...baseOpts,
-      scales: {{
-        x: {{ ...baseOpts.scales.x,
-              ticks: {{ ...baseOpts.scales.x.ticks, autoSkip:false, maxRotation:30 }} }},
-        y: {{ ...baseOpts.scales.y, min:0, max:100,
-              ticks: {{ ...baseOpts.scales.y.ticks, callback: v => v+'%' }} }}
-      }}
+if(tL.length && document.getElementById('tipoChart')){{
+  const cols=['#1D9E75','#378ADD','#BA7517','#D4537E','#7F77DD','#639922'];
+  new Chart(document.getElementById('tipoChart'),{{type:'bar',data:{{labels:tL,datasets:[
+    {{label:'Confianza %',data:tV,
+      backgroundColor:tL.map((_,i)=>cols[i%cols.length]+'CC'),
+      borderColor:tL.map((_,i)=>cols[i%cols.length]),borderWidth:1}}
+  ]}},options:{{...base,
+    scales:{{
+      x:{{...base.scales.x,ticks:{{...base.scales.x.ticks,autoSkip:false,maxRotation:30}}}},
+      y:{{...base.scales.y,min:0,max:100,ticks:{{...base.scales.y.ticks,callback:v=>v+'%'}}}}
     }}
-  }});
+  }}}});
 }}
 </script>
 """
-    st.components.v1.html(html, height=900, scrolling=True)
+    st.components.v1.html(html, height=_height, scrolling=True)
+
 
 
 def _page_help(st):
