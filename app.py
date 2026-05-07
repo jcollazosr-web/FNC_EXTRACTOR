@@ -6667,6 +6667,26 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
     if _resolved_enabled and _resolved_url:
         try:
             sheets_mgr = GoogleSheetsManager(_resolved_url, creds_path or "")
+            # Prueba inmediata de escritura para confirmar acceso
+            try:
+                _test_ws = sheets_mgr.ws_data
+                _test_ws.append_row(
+                    ["TEST_CONEXION", datetime.utcnow().isoformat(),
+                     "ok", "", "", "", "", ""],
+                    value_input_option="USER_ENTERED"
+                )
+                # Borrar la fila de prueba
+                _last = len(_test_ws.get_all_values())
+                if _last > 0:
+                    _test_ws.delete_rows(_last)
+                _st.success("✅ Google Sheets conectado y con acceso de escritura")
+            except Exception as _we:
+                _st.error("❌ Sheets conectado pero sin permiso de ESCRITURA: " + str(_we) +
+                          ". Asegúrate de que " +
+                          (sheets_mgr.spreadsheet.client.auth.service_account_email
+                           if hasattr(sheets_mgr, 'spreadsheet') else "la cuenta de servicio") +
+                          " tiene rol Editor (no Lector).")
+                sheets_mgr = None
         except Exception as e:
             _st.warning("Sheets no conectado (la extraccion continua): " + str(e))
     enable_anon     = _st.session_state.get("cfg_anon_v",     False)
@@ -6758,8 +6778,15 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
 
     done   = sum(1 for r in new_results if r.get("_status") == "done")
     errors = sum(1 for r in new_results if "error" in r.get("_status", ""))
-    _st.success(f"{done} documento(s) extraidos correctamente."
-                + (f" {errors} con error." if errors else ""))
+
+    _msg = f"{done} documento(s) extraidos correctamente."
+    if errors:
+        _msg += f" {errors} con error."
+    if sheets_mgr and done > 0:
+        _msg += f" {done} fila(s) enviadas a Google Sheets."
+    elif sheets_mgr and done == 0:
+        _msg += " (sin resultados exitosos para enviar a Sheets)"
+    _st.success(_msg)
 
 
 def _page_upload(st, user_payload, api_key, provider, model, max_tokens,
