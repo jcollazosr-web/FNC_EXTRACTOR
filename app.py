@@ -729,6 +729,33 @@ def decrypt_clinical_data(data: str) -> str:
         return data  # Compatible con datos no cifrados (migración)
 
 
+# ── Configuración persistente cifrada en DB ──────────────────────
+
+def save_app_config(key: str, value: str, updated_by: str = "system"):
+    """Guarda un valor de configuración cifrado en la DB de seguridad."""
+    encrypted = encrypt_clinical_data(value)
+    con = _sec_db()
+    con.execute(
+        "INSERT INTO app_config (key, value, updated_at, updated_by) VALUES (?,?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+        (key, encrypted, datetime.utcnow().isoformat(), updated_by)
+    )
+    con.commit()
+
+
+def load_app_config(key: str, default: str = "") -> str:
+    """Lee y descifra un valor de configuración desde la DB de seguridad."""
+    try:
+        con = _sec_db()
+        row = con.execute("SELECT value FROM app_config WHERE key=?", (key,)).fetchone()
+        if row:
+            return decrypt_clinical_data(row[0])
+    except Exception:
+        pass
+    return default
+
+
 # ── Hash de contraseña (bcrypt con cost factor 12) ──────────────
 
 def hash_password(password: str) -> str:
@@ -873,6 +900,14 @@ def init_security_db():
     CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON security_audit(timestamp_utc DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_user      ON security_audit(user_id);
     CREATE INDEX IF NOT EXISTS idx_audit_email     ON security_audit(email);
+
+    -- Configuración persistente cifrada (API keys, credenciales externas)
+    CREATE TABLE IF NOT EXISTS app_config (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT
+    );
     """)
     con.commit()
     con.close()
@@ -2933,12 +2968,35 @@ class GoogleSheetsManager:
     def _load_credentials_data(credentials_path: str) -> dict:
         """
         Carga las credenciales de Google en este orden de prioridad:
-        1. Streamlit Secrets (st.secrets["gcp_service_account"]) — persistente en Streamlit Cloud
-        2. Variable de entorno GOOGLE_CREDENTIALS_JSON (JSON string)
-        3. Archivo físico credentials_path — solo funciona en servidor propio
-        Si ninguna fuente está disponible, lanza un error claro.
+        1. session_state["_gcp_creds_json"] — pegado directamente en el editor de la app
+        2. Streamlit Secrets (st.secrets["gcp_service_account"]) — persistente en Streamlit Cloud
+        3. Variable de entorno GOOGLE_CREDENTIALS_JSON (JSON string)
+        4. Archivo físico credentials_path — solo funciona en servidor propio
         """
-        # ── Fuente 1: Streamlit Secrets ──────────────────────────────────
+        # ── Fuente 1: DB cifrada (persistente) ──────────────────────────
+        try:
+            raw_db = load_app_config("gcp_credentials_json", "").strip()
+            if raw_db:
+                cred_dict = json.loads(raw_db)
+                if cred_dict.get("type") == "service_account":
+                    log.info("✅ Credenciales Google cargadas desde DB cifrada")
+                    return cred_dict
+        except Exception:
+            pass
+
+        # ── Fuente 2: Editor JSON en session_state (fallback de sesión) ──
+        try:
+            import streamlit as _st
+            raw_json = _st.session_state.get("_gcp_creds_json", "").strip()
+            if raw_json:
+                cred_dict = json.loads(raw_json)
+                if cred_dict.get("type") == "service_account":
+                    log.info("✅ Credenciales Google cargadas desde session_state")
+                    return cred_dict
+        except Exception:
+            pass
+
+        # ── Fuente 3: Streamlit Secrets ──────────────────────────────────
         try:
             import streamlit as _st
             if "gcp_service_account" in _st.secrets:
@@ -2948,7 +3006,7 @@ class GoogleSheetsManager:
         except Exception:
             pass
 
-        # ── Fuente 2: Variable de entorno ────────────────────────────────
+        # ── Fuente 4: Variable de entorno ────────────────────────────────
         env_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
         if env_creds.strip():
             try:
@@ -2958,7 +3016,7 @@ class GoogleSheetsManager:
             except json.JSONDecodeError:
                 log.warning("GOOGLE_CREDENTIALS_JSON no es JSON válido")
 
-        # ── Fuente 3: Archivo físico (servidor propio) ───────────────────
+        # ── Fuente 5: Archivo físico (servidor propio) ───────────────────
         if credentials_path:
             creds_path = Path(credentials_path)
             if creds_path.exists():
@@ -2972,15 +3030,50 @@ class GoogleSheetsManager:
         # ── Sin fuente disponible ────────────────────────────────────────
         raise FileNotFoundError(
             "No se encontraron credenciales de Google. "
-            "Opciones: (1) Streamlit Cloud: agrega [gcp_service_account] en Settings > Secrets. "
-            "(2) Servidor propio: sube credentials.json en Configuracion > Google Sheets. "
-            "(3) Variable de entorno: GOOGLE_CREDENTIALS_JSON con el JSON completo."
+            "Pega el contenido del credentials.json en Configuracion > Google Sheets > Editor JSON, ""o guarda las credenciales con el boton Guardar de forma permanente."
         )
+
+    @staticmethod
+    def _auto_share_sheet(drive_service, sheet_id: str, service_account_email: str):
+        """
+        Comparte el Sheet automáticamente con el email de la cuenta de servicio
+        usando la API de Google Drive. Si ya tiene acceso, no hace nada.
+        """
+        try:
+            # Verificar si ya tiene permiso
+            perms = drive_service.permissions().list(
+                fileId=sheet_id, fields="permissions(emailAddress,role)"
+            ).execute().get("permissions", [])
+
+            already = any(
+                p.get("emailAddress", "").lower() == service_account_email.lower()
+                for p in perms
+            )
+            if already:
+                log.info(f"✅ Sheet ya compartido con {service_account_email}")
+                return True
+
+            # Compartir con rol editor
+            drive_service.permissions().create(
+                fileId=sheet_id,
+                body={
+                    "type": "user",
+                    "role": "writer",
+                    "emailAddress": service_account_email,
+                },
+                sendNotificationEmail=False,
+            ).execute()
+            log.info(f"✅ Sheet compartido automáticamente con {service_account_email}")
+            return True
+        except Exception as e:
+            log.warning(f"No se pudo compartir el Sheet automáticamente: {e}")
+            return False
 
     def _connect(self):
         try:
             from google.oauth2.service_account import Credentials
             import gspread
+            from googleapiclient.discovery import build as _build
 
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
@@ -2993,6 +3086,17 @@ class GoogleSheetsManager:
 
             # Extraer el ID del spreadsheet (acepta URL completa o ID puro)
             sheet_id = self._extract_sheet_id(self.spreadsheet_url)
+
+            # ── Auto-compartir con la cuenta de servicio ─────────────────
+            service_account_email = cred_data.get("client_email", "")
+            if service_account_email:
+                try:
+                    drive_svc = _build("drive", "v3", credentials=creds)
+                    self._auto_share_sheet(drive_svc, sheet_id, service_account_email)
+                except Exception as _e:
+                    log.warning(f"Auto-share omitido: {_e}")
+
+            # ── Abrir el spreadsheet ──────────────────────────────────────
             try:
                 self.spreadsheet = self.gc.open_by_key(sheet_id)
             except Exception:
@@ -6691,7 +6795,7 @@ def _page_quality(st, results):
             if val >= 50: return "color: #BA7517"
             return "color: #A32D2D"
         st.dataframe(
-            df_comp.style.applymap(color_completitud, subset=["Completitud (%)"]),
+            df_comp.style.map(color_completitud, subset=["Completitud (%)"]),
             use_container_width=True, hide_index=True, height=280
         )
 
@@ -6900,32 +7004,160 @@ def _page_settings(st, user_payload):
         sheets_enabled = st.checkbox("Habilitar Google Sheets", key="cfg_sheets", disabled=_ro)
         sheets_url = creds_path = ""
         if sheets_enabled:
-            sheets_url  = st.text_input("URL del Spreadsheet",
-                                         value=_def_sheets_url, key="cfg_shurl", disabled=_ro)
+            sheets_url = st.text_input("URL del Spreadsheet",
+                                        value=_def_sheets_url, key="cfg_shurl", disabled=_ro)
 
-            # Detectar si las credenciales ya están en Streamlit Secrets
+            # ── Detectar fuente de credenciales activa ────────────────────
+            _has_db      = False
             _has_secrets = False
+            _has_session = False
+
+            _raw_db = load_app_config("gcp_credentials_json", "").strip()
+            if _raw_db:
+                try:
+                    _has_db = json.loads(_raw_db).get("type") == "service_account"
+                except Exception:
+                    pass
             try:
-                import streamlit as _st_chk
-                _has_secrets = "gcp_service_account" in _st_chk.secrets
+                import streamlit as _stchk
+                _has_secrets = "gcp_service_account" in _stchk.secrets
             except Exception:
                 pass
+            _raw_ss = st.session_state.get("_gcp_creds_json", "").strip()
+            if _raw_ss:
+                try:
+                    _has_session = json.loads(_raw_ss).get("type") == "service_account"
+                except Exception:
+                    pass
 
-            if _has_secrets:
-                st.success("✅ Credenciales de Google detectadas en Streamlit Secrets. "
-                           "No necesitas subir el archivo credentials.json.")
-            elif not _ro:
-                st.info("💡 **Streamlit Cloud:** agrega las credenciales en "
-                        "Settings → Secrets como [gcp_service_account] para que persistan. "
-                        "El archivo que subas aquí se borra al reiniciar la app.")
-                creds_file = st.file_uploader("credentials.json (temporal)", type=["json"], key="cfg_shcreds")
-                if creds_file:
-                    creds_path = "/tmp/gsheet_creds.json"
-                    Path(creds_path).write_bytes(creds_file.read())
-                    st.success("✅ Archivo cargado para esta sesión.")
+            if _has_db:
+                _db_email = ""
+                try:
+                    _db_email = json.loads(_raw_db).get("client_email", "")
+                except Exception:
+                    pass
+                st.success(f"✅ Credenciales guardadas permanentemente en DB cifrada"
+                           + (f" — {_db_email}" if _db_email else ""))
+            elif _has_secrets:
+                st.success("✅ Credenciales activas: Streamlit Secrets")
+            elif _has_session:
+                st.info("⚠️ Credenciales activas solo en esta sesión — usa 'Guardar permanentemente'")
+
+            # ── Editor JSON de credenciales ───────────────────────────────
+            if not _ro:
+                _PLACEHOLDER = """{
+  "type": "service_account",
+  "project_id": "tu-proyecto",
+  "private_key_id": "abc123",
+  "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n",
+  "client_email": "nombre@tu-proyecto.iam.gserviceaccount.com",
+  "client_id": "123456789",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/..."
+}"""
+                # Pre-cargar desde DB si existe
+                _editor_default = _raw_db if _has_db else st.session_state.get("_gcp_creds_json", "")
+
+                with st.expander(
+                    "🔑 Credenciales JSON — pega el contenido de credentials.json",
+                    expanded=not _has_db
+                ):
+                    st.caption(
+                        "Abre tu archivo **credentials.json** con el Bloc de notas o VS Code, "
+                        "copia todo el contenido y pégalo aquí. "
+                        "Haz clic en **💾 Guardar permanentemente** para cifrarlas en la base de datos."
+                    )
+                    _json_input = st.text_area(
+                        "credentials.json",
+                        value=_editor_default,
+                        height=280,
+                        placeholder=_PLACEHOLDER,
+                        key="cfg_gcp_json_editor",
+                        label_visibility="collapsed",
+                    )
+
+                    c1, c2, c3 = st.columns([2, 2, 1])
+
+                    if c1.button("💾 Guardar permanentemente", key="btn_save_gcp", type="primary"):
+                        _txt = _json_input.strip()
+                        if not _txt:
+                            st.error("El campo está vacío.")
+                        else:
+                            try:
+                                _parsed = json.loads(_txt)
+                                if _parsed.get("type") != "service_account":
+                                    st.error("El JSON no parece un Service Account de Google "
+                                             "(falta \"type\": \"service_account\").")
+                                else:
+                                    save_app_config(
+                                        "gcp_credentials_json", _txt,
+                                        updated_by=user_payload.get("sub", "admin")
+                                    )
+                                    st.session_state["_gcp_creds_json"] = _txt
+                                    st.success(
+                                        f"✅ Guardado permanentemente en DB cifrada para: "
+                                        f"{_parsed.get('client_email', '—')}. "
+                                        "Persistirá entre reinicios."
+                                    )
+                                    st.rerun()
+                            except json.JSONDecodeError as _je:
+                                st.error(f"JSON inválido — línea {_je.lineno}: {_je.msg}. "
+                                         "Verifica que copiaste el archivo completo.")
+
+                    if c2.button("▶️ Aplicar solo en esta sesión", key="btn_apply_gcp"):
+                        _txt = _json_input.strip()
+                        if not _txt:
+                            st.error("El campo está vacío.")
+                        else:
+                            try:
+                                _parsed = json.loads(_txt)
+                                if _parsed.get("type") != "service_account":
+                                    st.error("El JSON no parece un Service Account de Google.")
+                                else:
+                                    st.session_state["_gcp_creds_json"] = _txt
+                                    st.success(f"✅ Aplicado para esta sesión: "
+                                               f"{_parsed.get('client_email', '—')}")
+                                    st.rerun()
+                            except json.JSONDecodeError as _je:
+                                st.error(f"JSON inválido: {_je.msg}")
+
+                    if c3.button("🗑️ Borrar", key="btn_clear_gcp"):
+                        save_app_config("gcp_credentials_json", "",
+                                        updated_by=user_payload.get("sub", "admin"))
+                        st.session_state.pop("_gcp_creds_json", None)
+                        st.rerun()
+
             else:
-                st.caption("🔒 Solo el administrador puede subir credenciales.")
-            st.caption("Sincronización bidireccional de deduplicación con Sheets")
+                if not (_has_db or _has_secrets or _has_session):
+                    st.warning("⚠️ No hay credenciales de Google configuradas. "
+                               "Contacta al administrador.")
+                st.caption("🔒 Solo el administrador puede modificar las credenciales.")
+
+            # ── Botón de prueba de conexión ───────────────────────────────
+            if not _ro and sheets_url and (_has_db or _has_secrets or _has_session):
+                if st.button("Probar conexion y auto-compartir", key="btn_test_sheets"):
+                    with st.spinner("Conectando con Google Sheets..."):
+                        try:
+                            _mgr = GoogleSheetsManager(sheets_url, "")
+                            _svc_email = ""
+                            try:
+                                _raw = load_app_config("gcp_credentials_json", "")
+                                if not _raw:
+                                    import streamlit as _st2
+                                    _raw = json.dumps(dict(_st2.secrets.get("gcp_service_account", {})))
+                                _svc_email = json.loads(_raw).get("client_email", "")
+                            except Exception:
+                                pass
+                            st.success(
+                                "Conectado a: " + _mgr.spreadsheet.title + ". "
+                                + ("Compartido con " + _svc_email if _svc_email else "")
+                            )
+                        except Exception as _e:
+                            st.error(str(_e))
+
+            st.caption("Sincronizacion bidireccional de deduplicacion con Sheets")
 
     with st.expander("☁️ Salesforce"):
         sf_enabled = st.checkbox("Habilitar Salesforce", key="cfg_sf", disabled=_ro)
