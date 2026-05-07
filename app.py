@@ -2912,30 +2912,101 @@ class GoogleSheetsManager:
  
         self._connect()
  
+    @staticmethod
+    def _extract_sheet_id(url_or_id: str) -> str:
+        """
+        Acepta tanto la URL completa del navegador como solo el ID del spreadsheet.
+        Ejemplo URL: https://docs.google.com/spreadsheets/d/ID_AQUI/edit?gid=0#gid=0
+        Retorna solo el ID.
+        """
+        import re as _re
+        url_or_id = url_or_id.strip()
+        m = _re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url_or_id)
+        if m:
+            return m.group(1)
+        # Si ya es un ID puro (sin slashes)
+        if "/" not in url_or_id and len(url_or_id) > 10:
+            return url_or_id
+        return url_or_id
+
+    @staticmethod
+    def _load_credentials_data(credentials_path: str) -> dict:
+        """
+        Carga las credenciales de Google en este orden de prioridad:
+        1. Streamlit Secrets (st.secrets["gcp_service_account"]) — persistente en Streamlit Cloud
+        2. Variable de entorno GOOGLE_CREDENTIALS_JSON (JSON string)
+        3. Archivo físico credentials_path — solo funciona en servidor propio
+        Si ninguna fuente está disponible, lanza un error claro.
+        """
+        # ── Fuente 1: Streamlit Secrets ──────────────────────────────────
+        try:
+            import streamlit as _st
+            if "gcp_service_account" in _st.secrets:
+                cred_dict = dict(_st.secrets["gcp_service_account"])
+                log.info("✅ Credenciales Google cargadas desde Streamlit Secrets")
+                return cred_dict
+        except Exception:
+            pass
+
+        # ── Fuente 2: Variable de entorno ────────────────────────────────
+        env_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+        if env_creds.strip():
+            try:
+                cred_dict = json.loads(env_creds)
+                log.info("✅ Credenciales Google cargadas desde variable de entorno")
+                return cred_dict
+            except json.JSONDecodeError:
+                log.warning("GOOGLE_CREDENTIALS_JSON no es JSON válido")
+
+        # ── Fuente 3: Archivo físico (servidor propio) ───────────────────
+        if credentials_path:
+            creds_path = Path(credentials_path)
+            if creds_path.exists():
+                try:
+                    cred_dict = json.loads(creds_path.read_text())
+                    log.info(f"✅ Credenciales Google cargadas desde archivo: {credentials_path}")
+                    return cred_dict
+                except Exception as e:
+                    raise ValueError(f"Error leyendo credentials.json: {e}")
+
+        # ── Sin fuente disponible ────────────────────────────────────────
+        raise FileNotFoundError(
+            "No se encontraron credenciales de Google. "
+            "Opciones: (1) Streamlit Cloud: agrega [gcp_service_account] en Settings > Secrets. "
+            "(2) Servidor propio: sube credentials.json en Configuracion > Google Sheets. "
+            "(3) Variable de entorno: GOOGLE_CREDENTIALS_JSON con el JSON completo."
+        )
+
     def _connect(self):
         try:
             from google.oauth2.service_account import Credentials
             import gspread
- 
+
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
- 
-            cred_data = json.loads(Path(self.credentials_path).read_text())
+
+            cred_data = self._load_credentials_data(self.credentials_path)
             creds = Credentials.from_service_account_info(cred_data, scopes=scopes)
             self.gc = gspread.authorize(creds)
-            self.spreadsheet = self.gc.open_by_url(self.spreadsheet_url)
- 
+
+            # Extraer el ID del spreadsheet (acepta URL completa o ID puro)
+            sheet_id = self._extract_sheet_id(self.spreadsheet_url)
+            try:
+                self.spreadsheet = self.gc.open_by_key(sheet_id)
+            except Exception:
+                self.spreadsheet = self.gc.open_by_url(self.spreadsheet_url)
+
             self.ws_data    = self._get_or_create_sheet("Extracciones")
             self.ws_review  = self._get_or_create_sheet("Revisar_Manual")
             self.ws_alerts  = self._get_or_create_sheet("Alertas_Medicas")
             self.ws_quality = self._get_or_create_sheet("Calidad_Campos")
- 
+
             log.info(f"✅ Google Sheets conectado: {self.spreadsheet.title}")
- 
+
         except FileNotFoundError:
-            raise FileNotFoundError(f"No se encontró: {self.credentials_path}")
+            raise
         except Exception as e:
             log.error(f"❌ Error Google Sheets: {e}")
             raise
@@ -5958,6 +6029,7 @@ def _sidebar_nav(st, active_page: str, user_role: str, results: list) -> str:
         ]
         pages_system = [
             ("⚙️  Configuración",       "settings"),
+            ("📖  Ayuda / Manual",       "help"),
         ]
         if user_role == Role.ADMIN:
             pages_system.append(("👑  Usuarios y seguridad", "admin"))
@@ -6020,11 +6092,14 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
         return
 
     sheets_mgr = None
-    if sheets_enabled and sheets_url and creds_path:
+    if sheets_enabled and sheets_url:
         try:
-            sheets_mgr = GoogleSheetsManager(sheets_url, creds_path)
+            # credentials_path puede ser "" si las credenciales vienen de Streamlit Secrets
+            sheets_mgr = GoogleSheetsManager(sheets_url, creds_path or "")
+        except FileNotFoundError as e:
+            _st.error(f"❌ {e}")
         except Exception as e:
-            _st.warning(f"No se pudo conectar a Google Sheets: {e}")
+            _st.error(f"❌ No se pudo conectar a Google Sheets: {e}")
 
     enable_anon     = _st.session_state.get("cfg_anon_v",     False)
     enable_ensemble = _st.session_state.get("cfg_ensemble_v", True)
@@ -6827,11 +6902,27 @@ def _page_settings(st, user_payload):
         if sheets_enabled:
             sheets_url  = st.text_input("URL del Spreadsheet",
                                          value=_def_sheets_url, key="cfg_shurl", disabled=_ro)
-            if not _ro:
-                creds_file  = st.file_uploader("credentials.json", type=["json"], key="cfg_shcreds")
+
+            # Detectar si las credenciales ya están en Streamlit Secrets
+            _has_secrets = False
+            try:
+                import streamlit as _st_chk
+                _has_secrets = "gcp_service_account" in _st_chk.secrets
+            except Exception:
+                pass
+
+            if _has_secrets:
+                st.success("✅ Credenciales de Google detectadas en Streamlit Secrets. "
+                           "No necesitas subir el archivo credentials.json.")
+            elif not _ro:
+                st.info("💡 **Streamlit Cloud:** agrega las credenciales en "
+                        "Settings → Secrets como [gcp_service_account] para que persistan. "
+                        "El archivo que subas aquí se borra al reiniciar la app.")
+                creds_file = st.file_uploader("credentials.json (temporal)", type=["json"], key="cfg_shcreds")
                 if creds_file:
                     creds_path = "/tmp/gsheet_creds.json"
                     Path(creds_path).write_bytes(creds_file.read())
+                    st.success("✅ Archivo cargado para esta sesión.")
             else:
                 st.caption("🔒 Solo el administrador puede subir credenciales.")
             st.caption("Sincronización bidireccional de deduplicación con Sheets")
@@ -7377,6 +7468,220 @@ def _render_force_change_password(st, user_payload: Dict, user_id: str, token: s
                    "Nadie — ni el administrador — puede verla.")
 
 
+def _page_help(st):
+    """Página: manual de usuario integrado en la app."""
+
+    st.markdown("""
+> **Clinical Extractor Pro v15** — Guía completa para médicos y personal administrativo.
+""")
+
+    # ── Sección 1 ──────────────────────────────────────────────────────────
+    with st.expander("1. ¿Qué es esta aplicación?", expanded=True):
+        st.markdown("""
+**Clinical Extractor Pro** extrae automáticamente información clínica de documentos médicos
+(historias clínicas, órdenes, epicrisis, etc.) usando inteligencia artificial.
+
+En lugar de leer manualmente cada documento, la app lo hace en segundos y organiza la
+información en una tabla lista para exportar o cargar a Salesforce / Google Sheets.
+
+> 🔒 Cumple **Ley 1581 de Colombia** y estándares HIPAA: cifrado AES-256, control de
+> accesos por rol y registro de auditoría inmutable.
+""")
+
+    # ── Sección 2 ──────────────────────────────────────────────────────────
+    with st.expander("2. Cómo ingresar"):
+        st.markdown("""
+El administrador le entregará:
+- 🌐 **URL** de la aplicación
+- 📧 **Usuario** (correo electrónico)
+- 🔑 **Contraseña** temporal
+
+> ⚠️ Tras **5 intentos fallidos** el acceso se bloquea 15 minutos. Contacte al administrador si queda bloqueado.
+""")
+
+    # ── Sección 3 ──────────────────────────────────────────────────────────
+    with st.expander("3. Roles y permisos"):
+        st.markdown("""
+| Función | 👑 Admin | ✏️ Editor | 👁️ Lector |
+|---|:---:|:---:|:---:|
+| Extraer documentos | ✅ | ✅ | ❌ |
+| Ver resultados | ✅ | ✅ | ✅ |
+| Editar resultados | ✅ | ✅ | ❌ |
+| Exportar datos | ✅ | ✅ | ❌ |
+| Modificar configuración | ✅ | ❌ | ❌ |
+| Gestionar usuarios | ✅ | ❌ | ❌ |
+| Ver registro de auditoría | ✅ | ❌ | ❌ |
+
+- **👑 Administrador:** control total — API keys, integraciones, usuarios.
+- **✏️ Editor:** extrae, edita y exporta resultados.
+- **👁️ Lector:** solo visualiza resultados.
+""")
+
+    # ── Sección 4 ──────────────────────────────────────────────────────────
+    with st.expander("4. Páginas de la aplicación"):
+        st.markdown("""
+| Sección | Para qué sirve |
+|---|---|
+| 📤 Subir documentos | Cargar PDFs o imágenes para extracción |
+| 📋 Resultados | Ver y editar los datos extraídos |
+| ⚠️ Revisar manualmente | Corregir campos con baja confianza |
+| 🔁 Duplicados | Documentos que ya fueron procesados |
+| 📈 Calidad y métricas | Tendencias de confianza y errores |
+| 🔍 Buscador clínico | Buscar por CIE-10, medicamento, fechas |
+| 📬 Cola de trabajos | Estado de lotes grandes en proceso |
+| ☁️ Salesforce | Extracción directa desde Salesforce |
+| ⚙️ Configuración | Ajustes del sistema (solo Admin puede modificar) |
+""")
+
+    # ── Sección 5 ──────────────────────────────────────────────────────────
+    with st.expander("5. Subir y procesar documentos"):
+        st.markdown("""
+**Formatos aceptados:** PDF, JPG, PNG, TIFF (nativos o escaneados).
+
+**Pasos:**
+1. Clic en **📤 Subir documentos** en el menú lateral.
+2. Arrastra el archivo o haz clic en **Examinar**.
+3. Espera la extracción (unos segundos por documento).
+4. Revisa los resultados — campos en 🔴 rojo requieren revisión manual.
+
+> 📷 **Documentos escaneados:** se usa OCR automático. Para mejor precisión,
+> la imagen debe tener al menos **300 DPI** y buena iluminación.
+
+**Varios archivos a la vez:** se procesan en paralelo. Puedes subir lotes completos.
+""")
+
+    # ── Sección 6 ──────────────────────────────────────────────────────────
+    with st.expander("6. Indicadores de confianza"):
+        col1, col2, col3 = st.columns(3)
+        col1.success("🟢 Verde >= 75% — Extracción confiable. Revisión opcional.")
+        col2.warning("🟡 Amarillo 50-74% — Confianza media. Se recomienda revisar.")
+        col3.error("🔴 Rojo < 50% — Confianza baja. Revisión obligatoria.")
+        st.markdown("""
+**Exportar resultados** (Editor o Admin): CSV · Excel · FHIR R4 · JSON
+""")
+
+    # ── Sección 7 ──────────────────────────────────────────────────────────
+    with st.expander("7. Revisión manual"):
+        st.markdown("""
+La sección **⚠️ Revisar manualmente** muestra:
+- **Campos con baja confianza** — el sistema no está seguro del valor extraído.
+- **Incoherencias clínicas** — ej. embarazo en paciente masculino, medicamento incompatible.
+- **Fragmento del documento** — texto original del que se extrajo cada dato.
+
+Para corregir: haz clic sobre el campo, escribe el valor correcto y confirma.
+Las correcciones quedan guardadas y mejoran futuras extracciones.
+""")
+
+    # ── Sección 8 ──────────────────────────────────────────────────────────
+    with st.expander("8. Control de duplicados"):
+        st.markdown("""
+La app detecta automáticamente documentos ya procesados (por hash SHA-256).
+
+En **🔁 Duplicados** puedes:
+- Ver la lista de archivos omitidos y cuándo se procesó el original.
+- **Forzar re-procesamiento** si el documento cambió.
+- Exportar el reporte de duplicados.
+""")
+
+    # ── Sección 9 ──────────────────────────────────────────────────────────
+    with st.expander("9. Configuración del sistema"):
+        st.markdown("""
+> 🔒 **Solo el Administrador puede modificar la configuración.**
+> Los demás usuarios la ven en modo lectura.
+
+| Sección | Qué configura |
+|---|---|
+| 🤖 Modelo de IA | Proveedor (Claude / GPT-4o), API key, modelo, tokens |
+| 📋 Plantilla | Campos a extraer según tipo de consulta |
+| 🔬 OCR | Idioma, DPI, EasyOCR, visión directa |
+| 📊 Google Sheets | URL del spreadsheet para sincronización |
+| ☁️ Salesforce | Credenciales y consultas SOQL |
+| ⚡ Procesamiento | Workers paralelos |
+| 🔬 Robustez | Anonimización, ensamble de modelos, umbral OCR |
+
+Presiona **💾 Guardar configuración en disco** para que los cambios persistan al reiniciar.
+""")
+
+    # ── Sección 10 ──────────────────────────────────────────────────────────
+    with st.expander("10. Google Sheets — conexión persistente"):
+        st.markdown("""
+En **Streamlit Cloud** el sistema de archivos es temporal. Para que las credenciales
+persistan entre reinicios:
+
+1. Abre tu `credentials.json` con un editor de texto.
+2. Ve a tu app → **Manage app → Settings → Secrets**.
+3. Agrega el contenido en formato TOML:
+
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "tu-proyecto"
+private_key_id = "abc123"
+private_key = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n"
+client_email = "...@....iam.gserviceaccount.com"
+client_id = "123456789"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+```
+
+4. Guarda — la app se reinicia y queda conectada permanentemente.
+
+> ✅ La app detecta automáticamente si las credenciales están en Secrets
+> y te lo indica en la sección Configuración.
+""")
+
+    # ── Sección 11 ──────────────────────────────────────────────────────────
+    with st.expander("11. Salesforce"):
+        st.markdown("""
+1. Activa la integración en **⚙️ Configuración → Salesforce** (solo Admin).
+2. Ingresa usuario, contraseña y Security Token de Salesforce.
+3. Escribe la consulta SOQL para seleccionar los registros.
+4. Haz clic en **Conectar Salesforce**.
+5. En **☁️ Salesforce**, selecciona registros y ejecuta la extracción.
+
+> 💡 **Modo incremental:** procesa solo registros nuevos desde la última ejecución.
+""")
+
+    # ── Sección 12 ──────────────────────────────────────────────────────────
+    with st.expander("12. Seguridad y privacidad"):
+        st.markdown("""
+- 🔐 Datos clínicos cifrados con **AES-256** en la base de datos local.
+- 🔐 Comunicaciones con la IA por **HTTPS**.
+- 🔐 **Anonimización** opcional: elimina nombre y documento, genera ID anónimo SHA-256.
+- 📋 **Registro de auditoría inmutable**: quién hizo qué, desde qué IP y a qué hora.
+  Solo el Admin puede verlo. Nadie puede borrarlo.
+
+> ⚠️ Si notas actividad sospechosa, notifica al administrador para revisar el audit log.
+
+> 🔐 **Nunca compartas tu contraseña** con nadie, incluido soporte técnico.
+""")
+
+    # ── Sección 13 — FAQ ──────────────────────────────────────────────────
+    with st.expander("13. Preguntas frecuentes"):
+        faqs = [
+            ("¿Por qué algunos campos aparecen en rojo?",
+             "La IA no pudo extraer ese dato con suficiente confianza. Corrígelo en **⚠️ Revisar manualmente**."),
+            ("¿Qué pasa si subo el mismo documento dos veces?",
+             "Se detecta como duplicado y se omite. Ve a **🔁 Duplicados** y activa 'Forzar re-extracción' si lo necesitas."),
+            ("¿Los datos se guardan si cierro sesión?",
+             "Sí, los resultados persisten en la base de datos. Solo la configuración no guardada (sin presionar 💾) se pierde."),
+            ("¿Puedo usar la app desde el celular?",
+             "Sí, la interfaz es responsiva. Para cargar documentos grandes se recomienda un computador."),
+            ("¿La extracción es muy imprecisa en un documento?",
+             "Verifica que el PDF tenga buena calidad. El Admin puede aumentar el DPI en Configuración → OCR."),
+            ("¿Cómo cambio mi contraseña?",
+             "Contacta al administrador — puede cambiar contraseñas desde el panel de administración."),
+            ("¿Qué es FHIR R4?",
+             "Estándar internacional de interoperabilidad clínica para compartir datos entre sistemas hospitalarios."),
+        ]
+        for q, a in faqs:
+            st.markdown(f"**{q}**")
+            st.markdown(f"{a}")
+            st.markdown("---")
+
+    st.caption("Clinical Extractor Pro v15 · Ley 1581 Colombia · HIPAA")
+
+
 def run_streamlit():
     """Interfaz Clinical Extractor Pro v13 — navegación lateral, UI simplificada."""
     import streamlit as st
@@ -7521,6 +7826,10 @@ def run_streamlit():
             _page_admin(st, user_payload)
         else:
             st.error("Acceso restringido al administrador.")
+
+    elif page == "help":
+        st.title("📖 Manual de usuario")
+        _page_help(st)
 
 
 
