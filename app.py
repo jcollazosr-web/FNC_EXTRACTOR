@@ -787,14 +787,16 @@ def verify_password(password: str, hashed: str) -> bool:
 
 # ── JWT para sesiones ────────────────────────────────────────────
 
-def create_session_token(user_id: str, email: str, role: str) -> str:
-    """Genera JWT firmado HS256 con expiración."""
+def create_session_token(user_id: str, email: str, role: str,
+                          ttl_hours: int = None) -> str:
+    """Genera JWT firmado HS256 con expiración. ttl_hours sobreescribe SESSION_TTL_H."""
+    _ttl = ttl_hours if ttl_hours is not None else SESSION_TTL_H
     payload = {
         "sub":   user_id,
         "email": email,
         "role":  role,
         "iat":   datetime.utcnow(),
-        "exp":   datetime.utcnow() + timedelta(hours=SESSION_TTL_H),
+        "exp":   datetime.utcnow() + timedelta(hours=_ttl),
         "jti":   secrets.token_hex(16),  # JWT ID para revocación
     }
     if JWT_AVAILABLE:
@@ -6452,6 +6454,9 @@ def _render_login_page(st):
                                   key="login_email", label_visibility="collapsed")
         password = st.text_input("Contraseña", type="password", placeholder="Contraseña",
                                   key="login_pass", label_visibility="collapsed")
+        remember = st.checkbox("Mantener sesión iniciada", key="login_remember",
+                               help="El token se guarda cifrado en la base de datos. "
+                                    "No necesitas volver a iniciar sesión aunque cierres el navegador.")
         if st.button("Iniciar sesión →", use_container_width=True, type="primary", key="btn_login"):
             if not email or not password:
                 st.error("Ingresa correo y contraseña.")
@@ -6459,13 +6464,30 @@ def _render_login_page(st):
                 ok, msg, user = authenticate_user(email.strip(), password,
                                                    ip="web", ua="streamlit/v13")
                 if ok and user:
+                    _token = user["_token"]
+                    # Si "recordar sesión", guardar token en DB cifrada con TTL extendida
+                    if remember:
+                        try:
+                            _long_token = create_session_token(
+                                user["id"], user["email"], user["role"],
+                                ttl_hours=24 * 30  # 30 días
+                            )
+                            save_app_config(
+                                f"remember_token_{user['id']}",
+                                _long_token,
+                                updated_by=user["id"]
+                            )
+                            _token = _long_token
+                        except Exception:
+                            pass  # usar token normal si falla
                     st.session_state.update({
-                        "_auth_token":       user["_token"],
+                        "_auth_token":       _token,
                         "_user_id":          user["id"],
                         "_user_email":       user["email"],
                         "_user_role":        user["role"],
                         "_user_name":        user.get("full_name", ""),
                         "_must_change_pass": user.get("_must_change_pass", False),
+                        "_remembered":       remember,
                     })
                     st.rerun()
                 else:
@@ -6538,8 +6560,17 @@ def _sidebar_nav(st, active_page: str, user_role: str, results: list) -> str:
         st.markdown("---")
         role_icon = {"admin": "👑", "editor": "✏️", "reader": "👁️"}.get(user_role, "👤")
         st.caption(f"{role_icon} {st.session_state.get('_user_email','')}")
-        if st.button("Cerrar sesión", key="btn_logout", use_container_width=True):
+        _is_remembered = st.session_state.get("_remembered", False)
+        _btn_label = "Cerrar sesión 🔓" if not _is_remembered else "Cerrar sesión (y olvidar) 🔓"
+        if st.button(_btn_label, key="btn_logout", use_container_width=True):
+            _uid = st.session_state.get("_user_id", "")
             logout_user(st.session_state.get("_auth_token", ""))
+            # Borrar token persistente de la DB si existía
+            if _uid:
+                try:
+                    save_app_config(f"remember_token_{_uid}", "", updated_by=_uid)
+                except Exception:
+                    pass
             for k in list(st.session_state.keys()):
                 if k.startswith("_"): del st.session_state[k]
             st.rerun()
@@ -7529,89 +7560,134 @@ def _page_settings(st, user_payload):
                         st.warning("No hay credenciales guardadas en DB")
                     if sheets_url:
                         _sid = GoogleSheetsManager._extract_sheet_id(sheets_url)
-                        st.write(f"**Sheet ID extraído:** {_sid}")
+                        st.write(f"**URL configurada:** `{sheets_url}`")
+                        st.write(f"**Sheet ID extraído:** `{_sid}`")
+                        # Verificar que el ID tiene el formato correcto
+                        import re as _re
+                        if _re.match(r"^[a-zA-Z0-9_-]{20,}$", _sid):
+                            st.success("✅ El ID parece válido")
+                        else:
+                            st.error(f"❌ El ID extraído no parece válido: '{_sid}'. "
+                                     "Verifica que la URL sea de Google Sheets "
+                                     "(debe contener /spreadsheets/d/ID)")
+                    else:
+                        st.warning("⚠️ No hay URL de Spreadsheet configurada en esta sesión. "
+                                   "Escribe la URL en el campo 'URL del Spreadsheet' y guarda la configuración.")
 
             # ── Botón de prueba de conexión ───────────────────────────────
-            if not _ro and sheets_url and (_has_db or _has_secrets or _has_session):
-                if st.button("🔌 Probar conexión", key="btn_test_sheets", type="primary"):
-                    with st.spinner("Verificando conexión con Google Sheets..."):
-                        try:
-                            # Cargar credenciales
-                            _raw_creds = load_app_config("gcp_credentials_json", "")
-                            if not _raw_creds:
-                                try:
-                                    import streamlit as _st2
-                                    _raw_creds = json.dumps(
-                                        dict(_st2.secrets.get("gcp_service_account", {}))
-                                    )
-                                except Exception:
-                                    pass
-                            _svc_email = ""
+            # Leer URL directamente del widget (no de session_state que puede estar desactualizado)
+            _url_to_test = (st.session_state.get("cfg_shurl") or sheets_url or
+                            load_app_config("GOOGLE_SHEET_URL", "") or
+                            _def_sheets_url).strip()
+
+            if not _ro and (_has_db or _has_secrets or _has_session):
+                if not _url_to_test:
+                    st.warning("Escribe la URL del Spreadsheet antes de probar.")
+                elif st.button("Probar conexion", key="btn_test_sheets", type="primary"):
+                    with st.spinner("Verificando..."):
+                        # ── Paso 1: cargar credenciales ───────────────────
+                        _raw_creds = load_app_config("gcp_credentials_json", "")
+                        if not _raw_creds:
                             try:
-                                _svc_email = json.loads(_raw_creds).get("client_email", "")
+                                import streamlit as _st2
+                                _raw_creds = json.dumps(
+                                    dict(_st2.secrets.get("gcp_service_account", {}))
+                                )
                             except Exception:
                                 pass
 
-                            # Conectar (incluye auto-share internamente)
-                            _mgr = GoogleSheetsManager(sheets_url, "")
+                        if not _raw_creds:
+                            st.error("No hay credenciales guardadas. "
+                                     "Pega el credentials.json en el editor de arriba.")
+                        else:
+                            try:
+                                _cred_data = json.loads(_raw_creds)
+                                _svc_email = _cred_data.get("client_email", "")
+                                _sheet_id  = GoogleSheetsManager._extract_sheet_id(_url_to_test)
 
-                            # Obtener resultado del auto-share para mostrarlo
-                            from google.oauth2.service_account import Credentials as _GCreds
-                            from googleapiclient.discovery import build as _gbuild
-                            _cred_data = json.loads(_raw_creds)
-                            _creds = _GCreds.from_service_account_info(
-                                _cred_data,
-                                scopes=[
+                                st.caption(f"Sheet ID: `{_sheet_id}`")
+                                st.caption(f"Cuenta de servicio: `{_svc_email}`")
+
+                                from google.oauth2.service_account import Credentials as _GC
+                                from googleapiclient.discovery import build as _gb
+                                _scopes = [
                                     "https://www.googleapis.com/auth/spreadsheets",
                                     "https://www.googleapis.com/auth/drive",
                                 ]
-                            )
-                            _drive = _gbuild("drive", "v3", credentials=_creds)
-                            _sheet_id = GoogleSheetsManager._extract_sheet_id(sheets_url)
-                            _share_result = GoogleSheetsManager._auto_share_sheet(
-                                _drive, _sheet_id, _svc_email
-                            )
+                                _creds = _GC.from_service_account_info(_cred_data,
+                                                                        scopes=_scopes)
 
-                            # ── Mostrar resultado detallado ───────────────
-                            st.success(f"✅ Conectado a: **{_mgr.spreadsheet.title}**")
+                                # ── Paso 2: compartir PRIMERO via Drive API ───
+                                st.caption("Paso 1/2: Otorgando permisos...")
+                                try:
+                                    _drive = _gb("drive", "v3", credentials=_creds,
+                                                 cache_discovery=False)
+                                    _share = GoogleSheetsManager._auto_share_sheet(
+                                        _drive, _sheet_id, _svc_email
+                                    )
+                                    _ss = _share.get("status")
+                                    if _ss == "ya_compartido":
+                                        st.info(f"Permisos: ya estaba compartido con {_svc_email}")
+                                    elif _ss == "compartido_ahora":
+                                        st.success(f"Permiso otorgado ahora a {_svc_email}")
+                                    else:
+                                        # Drive API fallo — mostrar instruccion manual
+                                        st.warning(
+                                            "No se pudo compartir automaticamente. "
+                                            "Comparte el Sheet manualmente: "
+                                            "1) Abre tu Google Sheet. "
+                                            "2) Clic en Compartir (arriba a la derecha). "
+                                            "3) Escribe este correo: " + _svc_email + ". "
+                                            "4) Asigna rol Editor. "
+                                            "5) Regresa y haz clic en Probar conexion."
+                                        )
+                                except Exception as _de:
+                                    st.warning(
+                                        f"Drive API no disponible ({_de}). "
+                                        f"Comparte el Sheet manualmente con: `{_svc_email}` (rol Editor), "
+                                        f"luego prueba de nuevo."
+                                    )
 
-                            _status = _share_result.get("status")
-                            _msg    = _share_result.get("message", "")
+                                # ── Paso 3: abrir el Sheet ────────────────────
+                                st.caption("Paso 2/2: Conectando al spreadsheet...")
+                                try:
+                                    import gspread as _gsp
+                                    _gc = _gsp.service_account_from_dict(_cred_data)
+                                    _sp = _gc.open_by_key(_sheet_id)
+                                    st.success(
+                                        f"Conectado a: **{_sp.title}**   "
+                                        f"({len(_sp.worksheets())} hoja(s))"
+                                    )
+                                    st.caption(
+                                        "Hojas: " + ", ".join(
+                                            ws.title for ws in _sp.worksheets()
+                                        )
+                                    )
+                                    # Guardar la URL en DB para que persista
+                                    save_app_config("GOOGLE_SHEET_URL", _url_to_test,
+                                                    user_payload.get("sub","admin"))
 
-                            if _status == "ya_compartido":
-                                st.info(f"🔗 **Permisos:** {_msg}")
-                            elif _status == "compartido_ahora":
-                                st.success(f"🎉 **Compartido ahora:** {_msg}")
-                            elif _status == "error":
-                                st.warning(
-                                    "No se pudo compartir automaticamente. "
-                                    + _msg + " "
-                                    "Puedes compartirlo manualmente: abre el Sheet, "
-                                    "haz clic en Compartir, pega el email "
-                                    + _svc_email + " y asigna rol Editor."
-                                )
+                                except Exception as _oe:
+                                    _es = str(_oe)
+                                    if "404" in _es or "SpreadsheetNotFound" in _es:
+                                        st.error(
+                                            "El Sheet todavia no esta compartido con la cuenta "
+                                            "de servicio. Sigue los pasos de arriba para "
+                                            f"compartirlo con `{_svc_email}` y vuelve a intentar."
+                                        )
+                                    elif "403" in _es:
+                                        st.error(
+                                            f"Sin permiso. Asegurate de dar rol **Editor** "
+                                            f"(no solo Lector) a `{_svc_email}`."
+                                        )
+                                    else:
+                                        st.error(f"Error al abrir el Sheet: {_oe}")
 
-                            st.caption(
-                                f"📋 Hojas disponibles: "
-                                + ", ".join([
-                                    ws.title for ws in _mgr.spreadsheet.worksheets()
-                                ])
-                            )
-
-                        except PermissionError as _e:
-                            st.error(f"❌ Sin permisos: {_e}")
-                        except Exception as _e:
-                            _err = str(_e)
-                            st.error(f"❌ Error de conexion: {_err}")
-                            if "credentials" in _err.lower() or "json" in _err.lower():
-                                st.info("💡 Verifica que el JSON este completo y bien pegado.")
-                            elif "404" in _err or "not found" in _err.lower():
-                                st.info("💡 El spreadsheet no existe o la URL es incorrecta.")
-                            elif "403" in _err or "permission" in _err.lower():
-                                st.info("💡 Sin acceso al Sheet. Haz clic en Probar conexion "
-                                        "de nuevo para intentar compartirlo automaticamente.")
-                            elif "quota" in _err.lower():
-                                st.info("💡 Limite de cuota de Google API. Espera unos minutos.")
+                            except json.JSONDecodeError as _je:
+                                st.error(f"El JSON de credenciales es invalido: {_je}. "
+                                         "Vuelve a pegar el credentials.json completo.")
+                            except Exception as _ge:
+                                st.error(f"Error inesperado: {_ge}")
 
             st.caption("Sincronizacion bidireccional de deduplicacion con Sheets")
 
@@ -8962,9 +9038,44 @@ def run_streamlit():
         for w in st.session_state["_sys_warnings"]:
             st.warning(w)
 
-    # Autenticación
+    # Autenticación — verificar session_state o token persistente en DB
     token = st.session_state.get("_auth_token")
     user_payload = is_token_valid(token) if token else None
+
+    # Si no hay token en sesión, buscar token persistente ("recordar sesión") en DB
+    if not user_payload:
+        try:
+            # Buscar todos los tokens de tipo remember_token_*
+            _con = _sec_db()
+            _rows = _con.execute(
+                "SELECT key, value FROM app_config WHERE key LIKE 'remember_token_%'"
+            ).fetchall()
+            for _rk, _rv in _rows:
+                _raw = decrypt_clinical_data(_rv)
+                _pl  = is_token_valid(_raw)
+                if _pl:
+                    # Token válido encontrado — restaurar sesión automáticamente
+                    _uid = _pl.get("sub", "")
+                    _user_row = _con.execute(
+                        "SELECT id, email, role, full_name, is_active "
+                        "FROM users WHERE id=? AND is_active=1", (_uid,)
+                    ).fetchone()
+                    if _user_row:
+                        st.session_state.update({
+                            "_auth_token":  _raw,
+                            "_user_id":     _user_row[0],
+                            "_user_email":  _user_row[1],
+                            "_user_role":   _user_row[2],
+                            "_user_name":   _user_row[3] or "",
+                            "_remembered":  True,
+                        })
+                        user_payload = _pl
+                        token = _raw
+                        log.info(f"✅ Sesión restaurada automáticamente: {_user_row[1]}")
+                    break
+        except Exception as _re:
+            log.warning(f"No se pudo restaurar sesión: {_re}")
+
     if not user_payload:
         for k in ["_auth_token","_user_email","_user_role","_user_name","_user_id"]:
             st.session_state.pop(k, None)
