@@ -7971,22 +7971,16 @@ def _page_settings(st, user_payload):
                 f"(mismo proveedor, menor costo)"
             )
 
-            # Guardar en session_state para que _run_extraction_local lo use
-            st.session_state["cfg_sec_provider"] = sec_provider
-            st.session_state["cfg_sec_model"]    = sec_model
-            st.session_state["cfg_sec_key"]      = sec_api_key
         else:
             sec_provider = sec_model = sec_api_key = ""
 
-        # Guardar en _cfg_to_save (se añadirá al bloque de guardado más abajo)
+        # Preparar config secundaria para guardar (sin tocar session_state de widgets)
         st.session_state["_sec_cfg_ready"] = {
             "CEP_ENABLE_ENSEMBLE": "1" if _ens_enabled else "0",
-            "CEP_SEC_PROVIDER":    st.session_state.get("cfg_sec_prov",""),
-            "CEP_SEC_MODEL":       st.session_state.get("cfg_sec_model",""),
-            **({"OPENAI_API_KEY": st.session_state.get("cfg_sec_key","")}
-               if st.session_state.get("cfg_sec_prov","")=="openai"
-               else {"ANTHROPIC_API_KEY": st.session_state.get("cfg_sec_key","")}
-               if st.session_state.get("cfg_sec_prov","")=="claude"
+            "CEP_SEC_PROVIDER":    sec_provider,
+            "CEP_SEC_MODEL":       sec_model,
+            **({"OPENAI_API_KEY":    sec_api_key} if sec_provider == "openai"
+               else {"ANTHROPIC_API_KEY": sec_api_key} if sec_provider == "claude"
                else {})
         }
 
