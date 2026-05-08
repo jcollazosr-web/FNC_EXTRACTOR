@@ -825,23 +825,51 @@ def backup_to_drive(folder_id: str = "") -> dict:
         _ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         _name = f"cep_backup_{_ts}.zip"
 
-        # Subir usando el servicio de Drive ya autenticado
+        # ── Subir a Drive ─────────────────────────────────────────────────────
+        # Las cuentas de servicio no tienen cuota propia de almacenamiento.
+        # Solución: usar supportsAllDrives=True para que el archivo quede en la
+        # carpeta del usuario (que le compartió la carpeta a la cuenta de servicio).
         _meta = {
-            "name":    _name,
+            "name":     _name,
             "mimeType": "application/zip",
-            "parents": [_folder_id],
+            "parents":  [_folder_id],
         }
         _media = MediaIoBaseUpload(
             _io.BytesIO(_zip),
             mimetype="application/zip",
-            resumable=True,
+            resumable=False,   # sin resumable evita el endpoint que falla con SA
         )
         _file = _mgr.service.files().create(
-            body=_meta, media_body=_media, fields="id,webViewLink"
+            body=_meta,
+            media_body=_media,
+            fields="id,webViewLink",
+            supportsAllDrives=True,   # permite carpetas en Drive compartido y personal
         ).execute()
         _url = _file.get("webViewLink", "")
 
-        # Mantener solo los últimos 7 backups — borrar los más antiguos
+        # Transferir propiedad al dueño de la carpeta para garantizar cuota
+        # (solo aplica si la respuesta trae un id válido)
+        try:
+            if _file.get("id") and _folder_id:
+                # Obtener el email del dueño de la carpeta
+                _folder_meta = _mgr.service.files().get(
+                    fileId=_folder_id,
+                    fields="owners",
+                    supportsAllDrives=True,
+                ).execute()
+                _owner_email = (_folder_meta.get("owners") or [{}])[0].get("emailAddress","")
+                if _owner_email:
+                    _mgr.service.permissions().create(
+                        fileId=_file["id"],
+                        body={"type":"user","role":"owner","emailAddress":_owner_email},
+                        transferOwnership=True,
+                        supportsAllDrives=True,
+                    ).execute()
+                    log.info(f"Propiedad transferida a: {_owner_email}")
+        except Exception as _pe:
+            log.warning(f"No se pudo transferir propiedad (no es error crítico): {_pe}")
+
+        # Mantener solo los últimos 7 backups
         try:
             _all = _mgr.service.files().list(
                 q=f"'{_folder_id}' in parents and name contains 'cep_backup_' "
@@ -849,11 +877,16 @@ def backup_to_drive(folder_id: str = "") -> dict:
                 orderBy="name desc",
                 fields="files(id,name)",
                 pageSize=50,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
             ).execute().get("files", [])
-            for _old in _all[7:]:
+            for _old_f in _all[7:]:
                 try:
-                    _mgr.service.files().delete(fileId=_old["id"]).execute()
-                    log.info(f"Backup antiguo eliminado: {_old['name']}")
+                    _mgr.service.files().delete(
+                        fileId=_old_f["id"],
+                        supportsAllDrives=True,
+                    ).execute()
+                    log.info(f"Backup antiguo eliminado: {_old_f['name']}")
                 except Exception:
                     pass
         except Exception:
@@ -3284,7 +3317,8 @@ class GoogleDriveManager:
             resumable=True,
         )
         file_obj = self.service.files().create(
-            body=meta, media_body=media, fields="id,webViewLink"
+            body=meta, media_body=media, fields="id,webViewLink",
+            supportsAllDrives=True,
         ).execute()
         url = file_obj.get("webViewLink", "")
         log.info(f"✅ Excel subido a Drive: {filename} → {url}")
@@ -6445,14 +6479,20 @@ class ClinicalExtractor:
             if getattr(self, "enable_ensemble", True):
                 progress("🤝 Validación de ensamble...", 78)
                 try:
-                    sec_key = os.environ.get(
-                        "OPENAI_API_KEY" if self.provider == "claude"
-                        else "ANTHROPIC_API_KEY", "")
+                    # Leer key del modelo secundario: DB → env
+                    _sec_prov = (load_app_config("CEP_SEC_PROVIDER","") or
+                                 ("openai" if self.provider=="claude" else "claude"))
+                    _sec_env  = "OPENAI_API_KEY" if _sec_prov=="openai" else "ANTHROPIC_API_KEY"
+                    sec_key   = (load_app_config(_sec_env,"") or
+                                 os.environ.get(_sec_env,""))
+                    _sec_mdl  = load_app_config("CEP_SEC_MODEL","") or None
                     ens = ensemble_validate(
                         final_data, raw_text, self.tipo_consulta,
                         self.provider, self.api_key, self.model,
                         secondary_api_key=sec_key,
                     )
+                    if _sec_mdl and ens.get("_validador_modelo"):
+                        ens["_validador_modelo"] = f"{_sec_prov}/{_sec_mdl}"
                     flags = ens.get("flags_criticos", [])
                     if flags:
                         needs_review     = True
@@ -7865,6 +7905,91 @@ def _page_settings(st, user_payload):
         max_tokens           = cc1.slider("Max tokens", 1000, 8000, _def_max_tok, 500, key="cfg_tokens", disabled=_ro)
         confidence_threshold = cc2.slider("Umbral de confianza", 0.5, 1.0, _def_conf, 0.05, key="cfg_conf", disabled=_ro)
 
+    with st.expander("🤝 Modelo de validación (Ensamble)", expanded=False):
+        st.caption(
+            "Segundo modelo independiente que valida lo que extrajo el primero. "
+            "Si ambos discrepan en un campo clínico, el documento se marca para revisión manual. "
+            "Recomendado: si el primario es Claude → validador es GPT-4o (y viceversa)."
+        )
+        _ens_enabled = st.checkbox(
+            "Activar validación de ensamble",
+            value=_def_ensemble,
+            key="cfg_ensemble_v", disabled=_ro,
+            help="Desactivar reduce el costo de API pero elimina la validación cruzada."
+        )
+        if _ens_enabled:
+            _auto_sec = (provider == "claude")
+            ec1, ec2 = st.columns(2)
+
+            _def_sec_prov = load_app_config("CEP_SEC_PROVIDER","") or (
+                "openai" if provider == "claude" else "claude"
+            )
+            _sec_prov_opts = ["openai","claude"] if provider=="claude" else ["claude","openai"]
+            _sec_prov_idx  = _sec_prov_opts.index(_def_sec_prov) if _def_sec_prov in _sec_prov_opts else 0
+            sec_provider = ec1.selectbox(
+                "Proveedor validador",
+                _sec_prov_opts,
+                index=_sec_prov_idx,
+                format_func=lambda x: "GPT-4o (OpenAI)" if x=="openai" else "Claude (Anthropic)",
+                key="cfg_sec_prov", disabled=_ro,
+                help="Usa un proveedor diferente al principal para validación real cruzada."
+            )
+
+            _def_sec_model = load_app_config("CEP_SEC_MODEL","") or (
+                "gpt-4o-mini" if sec_provider=="openai" else "claude-haiku-4-5-20251001"
+            )
+            _sec_model_opts = (
+                ["gpt-4o","gpt-4o-mini","gpt-4-turbo"] if sec_provider=="openai"
+                else ["claude-haiku-4-5-20251001","claude-sonnet-4-6","claude-opus-4-6"]
+            )
+            _sec_mdl_idx = _sec_model_opts.index(_def_sec_model) if _def_sec_model in _sec_model_opts else 0
+            sec_model = ec1.selectbox(
+                "Modelo validador",
+                _sec_model_opts,
+                index=_sec_mdl_idx,
+                key="cfg_sec_model", disabled=_ro,
+            )
+
+            _def_sec_key = (
+                load_app_config("OPENAI_API_KEY","") or os.environ.get("OPENAI_API_KEY","")
+                if sec_provider=="openai"
+                else load_app_config("ANTHROPIC_API_KEY","") or os.environ.get("ANTHROPIC_API_KEY","")
+            )
+            sec_api_key = ec2.text_input(
+                f"API Key — {'OpenAI' if sec_provider=='openai' else 'Anthropic'}",
+                type="password",
+                value=_def_sec_key,
+                key="cfg_sec_key", disabled=_ro,
+                help=(
+                    "Si el proveedor validador es el mismo que el primario, "
+                    "puedes usar la misma API key. Si no tienes key del segundo proveedor, "
+                    "el sistema usará el modelo pequeño del proveedor primario como validador."
+                )
+            )
+            ec2.caption(
+                f"Sin key → validador: {'claude-haiku' if provider=='claude' else 'gpt-4o-mini'} "
+                f"(mismo proveedor, menor costo)"
+            )
+
+            # Guardar en session_state para que _run_extraction_local lo use
+            st.session_state["cfg_sec_provider"] = sec_provider
+            st.session_state["cfg_sec_model"]    = sec_model
+            st.session_state["cfg_sec_key"]      = sec_api_key
+        else:
+            sec_provider = sec_model = sec_api_key = ""
+
+        # Guardar en _cfg_to_save (se añadirá al bloque de guardado más abajo)
+        st.session_state["_sec_cfg_ready"] = {
+            "CEP_ENABLE_ENSEMBLE": "1" if _ens_enabled else "0",
+            "CEP_SEC_PROVIDER":    st.session_state.get("cfg_sec_prov",""),
+            "CEP_SEC_MODEL":       st.session_state.get("cfg_sec_model",""),
+            **({"OPENAI_API_KEY": st.session_state.get("cfg_sec_key","")}
+               if st.session_state.get("cfg_sec_prov","")=="openai"
+               else {"ANTHROPIC_API_KEY": st.session_state.get("cfg_sec_key","")}
+               if st.session_state.get("cfg_sec_prov","")=="claude"
+               else {})
+        }
+
     with st.expander("📋 Plantilla de extracción", expanded=True):
         tipo_consulta = st.selectbox("Tipo de consulta", list(PLANTILLAS_CONSULTA.keys()),
                                       key="cfg_tipo", disabled=_ro)
@@ -8586,6 +8711,10 @@ def _page_settings(st, user_payload):
                 _uid = user_payload.get("sub", "admin")
                 for _k, _v in _cfg_to_save.items():
                     save_app_config(_k, _v, updated_by=_uid)
+                # Guardar config del modelo secundario (ensemble)
+                for _k, _v in st.session_state.get("_sec_cfg_ready", {}).items():
+                    if _v:
+                        save_app_config(_k, _v, updated_by=_uid)
                 st.success(
                     f"✅ {len(_cfg_to_save)} parámetros guardados en DB cifrada y en archivo .env. "
                     "La configuración persiste entre reinicios automáticamente."
