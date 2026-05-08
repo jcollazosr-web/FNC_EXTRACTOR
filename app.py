@@ -8629,26 +8629,15 @@ def _page_settings(st, user_payload):
         if enable_anon:
             st.info("⚠️ Anonimización activa: los nombres y documentos NO serán almacenados. "
                     "Solo se guarda el ID anónimo SHA-256 para investigación longitudinal.")
-        st.session_state["cfg_anon_v"]     = enable_anon
-        st.session_state["cfg_ensemble_v"] = enable_ensemble
-        st.session_state["cfg_ocr_thr_v"]  = ocr_threshold
 
-    # Guardar en session_state para uso global
+
+    # Guardar solo claves que NO son key= de un widget
     for k,v in {
-        "cfg_api_key":api_key, "cfg_prov":provider, "cfg_mdl":model,
-        "cfg_max_tok":max_tokens, "cfg_conf_thr":confidence_threshold,
-        "cfg_lang_ocr":ocr_lang, "cfg_dpi_ocr":ocr_dpi,
-        "cfg_easyocr_v":use_easyocr if not use_vision_ocr else False,
-        "cfg_vision_v":use_vision_ocr,
-        "cfg_campos_v":campos_sel, "cfg_tipo_v":tipo_consulta,
-        "cfg_sheets_en":sheets_enabled, "cfg_sheets_url":sheets_url,
-        "cfg_creds_path":creds_path, "cfg_max_wrk":max_workers,
-        "cfg_sf_en":sf_enabled, "cfg_sf_user":sf_user, "cfg_sf_pass":sf_pass,
-        "cfg_sf_tok":sf_token, "cfg_sf_dom":sf_domain,
-        "cfg_sf_soql":sf_soql, "cfg_sf_tsoql":sf_text_soql,
-        "cfg_sf_lim":sf_limit, "cfg_sf_inc":sf_incremental,
+        "cfg_creds_path": creds_path,
+        "cfg_sheets_url": sheets_url,
     }.items():
-        st.session_state[k] = v
+        if k not in st.session_state:
+            st.session_state[k] = v
 
     # ── Botón de persistencia: guarda la configuración en .env ──────────────
     st.markdown("---")
