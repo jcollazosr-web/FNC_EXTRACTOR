@@ -803,105 +803,64 @@ def create_db_backup() -> bytes:
 
 def backup_to_drive(folder_id: str = "") -> dict:
     """
-    Sube el backup ZIP a Google Drive.
-    Si folder_id está vacío, usa gdrive_backup_folder guardado en DB.
-    Mantiene solo los últimos 7 backups en la carpeta (borra los más antiguos).
+    Guarda el backup de la DB en Google Sheets como hoja 'CEP_Backup'.
+    
+    Las cuentas de servicio de Google NO pueden subir archivos binarios a Drive
+    (error 403 storageQuotaExceeded — limitación permanente de Google).
+    Solución: serializar la DB en base64 y guardarlo en Sheets, que SÍ funciona
+    con cuentas de servicio.
+    
     Devuelve {"ok": bool, "url": str, "filename": str, "message": str}.
     """
-    _folder_id = (folder_id or
-                  load_app_config("gdrive_backup_folder_id", "") or
-                  GoogleDriveManager._extract_folder_id(
-                      load_app_config("gdrive_backup_folder_url", "")
-                  ))
-    if not _folder_id:
+    import base64 as _b64, io as _io
+
+    _sheets_url = (load_app_config("BACKUP_SHEET_URL", "") or
+                   os.environ.get("BACKUP_SHEET_URL", ""))
+    if not _sheets_url:
         return {"ok": False, "url": "", "filename": "",
-                "message": "No hay carpeta de backup configurada en Drive."}
+                "message": "No hay Sheets de backup configurado. "
+                           "Ve a 👑 Admin → 💾 Backup y pega la URL del Sheets de backup."}
     try:
-        from googleapiclient.http import MediaIoBaseUpload
-        import io as _io
+        _smgr  = GoogleSheetsManager(_sheets_url, "")
+        _gc    = _smgr.gc
+        _sp    = _smgr.spreadsheet
 
-        _mgr = GoogleDriveManager(_folder_id)
-        _zip  = create_db_backup()
-        _ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        _name = f"cep_backup_{_ts}.zip"
-
-        # ── Subir a Drive ─────────────────────────────────────────────────────
-        # Las cuentas de servicio no tienen cuota propia de almacenamiento.
-        # Solución: usar supportsAllDrives=True para que el archivo quede en la
-        # carpeta del usuario (que le compartió la carpeta a la cuenta de servicio).
-        _meta = {
-            "name":     _name,
-            "mimeType": "application/zip",
-            "parents":  [_folder_id],
-        }
-        _media = MediaIoBaseUpload(
-            _io.BytesIO(_zip),
-            mimetype="application/zip",
-            resumable=False,   # sin resumable evita el endpoint que falla con SA
-        )
-        _file = _mgr.service.files().create(
-            body=_meta,
-            media_body=_media,
-            fields="id,webViewLink",
-            supportsAllDrives=True,   # permite carpetas en Drive compartido y personal
-        ).execute()
-        _url = _file.get("webViewLink", "")
-
-        # Transferir propiedad al dueño de la carpeta para garantizar cuota
-        # (solo aplica si la respuesta trae un id válido)
+        # Obtener o crear hoja de backup
         try:
-            if _file.get("id") and _folder_id:
-                # Obtener el email del dueño de la carpeta
-                _folder_meta = _mgr.service.files().get(
-                    fileId=_folder_id,
-                    fields="owners",
-                    supportsAllDrives=True,
-                ).execute()
-                _owner_email = (_folder_meta.get("owners") or [{}])[0].get("emailAddress","")
-                if _owner_email:
-                    _mgr.service.permissions().create(
-                        fileId=_file["id"],
-                        body={"type":"user","role":"owner","emailAddress":_owner_email},
-                        transferOwnership=True,
-                        supportsAllDrives=True,
-                    ).execute()
-                    log.info(f"Propiedad transferida a: {_owner_email}")
-        except Exception as _pe:
-            log.warning(f"No se pudo transferir propiedad (no es error crítico): {_pe}")
-
-        # Mantener solo los últimos 7 backups
-        try:
-            _all = _mgr.service.files().list(
-                q=f"'{_folder_id}' in parents and name contains 'cep_backup_' "
-                  f"and trashed=false",
-                orderBy="name desc",
-                fields="files(id,name)",
-                pageSize=50,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute().get("files", [])
-            for _old_f in _all[7:]:
-                try:
-                    _mgr.service.files().delete(
-                        fileId=_old_f["id"],
-                        supportsAllDrives=True,
-                    ).execute()
-                    log.info(f"Backup antiguo eliminado: {_old_f['name']}")
-                except Exception:
-                    pass
+            _ws = _sp.worksheet("CEP_Backup")
         except Exception:
-            pass
+            _ws = _sp.add_worksheet("CEP_Backup", rows=20, cols=4)
 
-        log.info(f"✅ Backup automático subido a Drive: {_name}")
+        # Crear ZIP y codificar en base64 en chunks de 45000 chars
+        _zip   = create_db_backup()
+        _b64str = _b64.b64encode(_zip).decode("ascii")
+        _ts    = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        _name  = f"cep_backup_{_ts}.zip"
+        _chunk = 45000
+        _parts = [_b64str[i:i+_chunk] for i in range(0, len(_b64str), _chunk)]
+
+        # Escribir: fila 1 = encabezado, fila 2 = metadata, filas 3+ = chunks
+        _ws.clear()
+        _ws.append_row(["backup_name", "timestamp", "total_chunks", "size_bytes"],
+                       value_input_option="RAW")
+        _ws.append_row([_name, _ts, str(len(_parts)), str(len(_zip))],
+                       value_input_option="RAW")
+        for _i, _part in enumerate(_parts):
+            _ws.append_row([f"chunk_{_i}", _part, "", ""],
+                           value_input_option="RAW")
+
+        _url = _sp.url
+        log.info(f"✅ Backup guardado en Sheets: {_name} ({len(_parts)} chunks, {len(_zip)//1024} KB)")
         save_app_config("gdrive_last_backup", datetime.utcnow().isoformat(),
                         updated_by="auto_backup")
         return {"ok": True, "url": _url, "filename": _name,
-                "message": f"Backup subido: {_name}"}
+                "message": f"Backup guardado en Google Sheets (hoja CEP_Backup): "
+                           f"{len(_zip)//1024} KB · {len(_parts)} fragmentos"}
 
     except Exception as e:
-        log.error(f"❌ Error backup Drive: {e}")
+        log.error(f"❌ Error backup Sheets: {e}")
         return {"ok": False, "url": "", "filename": "",
-                "message": f"Error: {e}"}
+                "message": f"Error al guardar backup en Sheets: {e}"}
 
 
 def auto_restore_from_drive() -> dict:
@@ -930,10 +889,9 @@ def auto_restore_from_drive() -> dict:
 
     log.warning("⚠️ DB vacía o ausente al arrancar — buscando backup en Drive...")
 
-    # ── Verificar configuración de Drive ─────────────────────────────────
-    _folder_url = load_app_config("gdrive_backup_folder_url", "")
-    _folder_id  = (load_app_config("gdrive_backup_folder_id", "") or
-                   GoogleDriveManager._extract_folder_id(_folder_url))
+    # ── Verificar configuración de Sheets ────────────────────────────────
+    _sheets_url = (load_app_config("BACKUP_SHEET_URL", "") or
+                   os.environ.get("BACKUP_SHEET_URL", ""))
     _gcp_creds  = load_app_config("gcp_credentials_json", "")
 
     # Si no hay credenciales en DB, intentar Streamlit Secrets
@@ -946,43 +904,52 @@ def auto_restore_from_drive() -> dict:
         except Exception:
             pass
 
-    if not _folder_id or not _gcp_creds:
-        log.warning("No hay configuración de backup Drive — no se puede auto-restaurar.")
+    if not _sheets_url or not _gcp_creds:
+        log.warning("No hay BACKUP_SHEET_URL configurado — no se puede auto-restaurar.")
         return {
             "status": "no_config",
             "message": (
-                "La base de datos está vacía y no hay configuración de backup en Drive. "
+                "La base de datos está vacía y no hay Sheets de backup configurado. "
                 "Ve a 👑 Admin → 💾 Backup para restaurar manualmente."
             )
         }
 
-    # ── Buscar el backup más reciente en Drive ────────────────────────────
+    # ── Leer backup desde hoja CEP_Backup en Sheets ───────────────────────
     try:
-        _gd = GoogleDriveManager(_folder_id)
-        _files = _gd.service.files().list(
-            q=f"'{_folder_id}' in parents and name contains 'cep_backup_' "
-              f"and trashed=false",
-            orderBy="name desc",
-            fields="files(id,name,modifiedTime)",
-            pageSize=5,
-        ).execute().get("files", [])
+        import base64 as _b64
+        _smgr = GoogleSheetsManager(_sheets_url, "")
+        _sp   = _smgr.spreadsheet
 
-        if not _files:
+        try:
+            _ws = _sp.worksheet("CEP_Backup")
+        except Exception:
             return {
                 "status": "no_config",
-                "message": "No se encontraron backups en la carpeta de Drive configurada."
+                "message": "No se encontró la hoja 'CEP_Backup' en Google Sheets. "
+                           "Crea un backup primero desde 👑 Admin → 💾 Backup."
             }
 
-        _latest = _files[0]
-        log.info(f"Restaurando desde: {_latest['name']}")
+        _rows = _ws.get_all_values()
+        if len(_rows) < 3:
+            return {"status": "no_config",
+                    "message": "La hoja CEP_Backup está vacía — no hay backup disponible."}
 
-        # ── Descargar y restaurar ─────────────────────────────────────────
-        _zip_bytes = _gd.download_file(_latest["id"])
+        # Fila 2 = metadata: [nombre, timestamp, chunks, size]
+        _meta    = _rows[1]
+        _bk_name = _meta[0] if _meta else "backup_desconocido"
+        # Filas 3+ = chunks base64
+        _chunks  = [r[1] for r in _rows[2:] if len(r) > 1 and r[1]]
+        if not _chunks:
+            return {"status": "error", "message": "El backup en Sheets está vacío o corrupto."}
+
+        _b64str   = "".join(_chunks)
+        _zip_bytes = _b64.b64decode(_b64str)
+        log.info(f"Restaurando desde Sheets: {_bk_name} ({len(_zip_bytes)//1024} KB)")
 
         with _zf.ZipFile(_io.BytesIO(_zip_bytes)) as _z:
             _restored = []
             for _n in _z.namelist():
-                if "main" in _n and str(DB_PATH).endswith(".db"):
+                if "main" in _n:
                     Path(str(DB_PATH)).write_bytes(_z.read(_n))
                     _restored.append("DB principal")
                     log.info(f"✅ DB principal restaurada desde {_n}")
@@ -996,25 +963,18 @@ def auto_restore_from_drive() -> dict:
             return {
                 "status": "restored",
                 "message": (
-                    f"Base de datos restaurada automáticamente desde "
-                    f"**{_latest['name']}** ({', '.join(_restored)}). "
-                    f"La app está lista."
+                    f"Base de datos restaurada desde Google Sheets "
+                    f"(**{_bk_name}**, {', '.join(_restored)}). La app está lista."
                 )
             }
-        else:
-            return {
-                "status": "error",
-                "message": f"El ZIP {_latest['name']} no contenía archivos de DB reconocibles."
-            }
+        return {"status": "error",
+                "message": f"El ZIP no contenía archivos de DB reconocibles."}
 
     except Exception as e:
-        log.error(f"❌ Error en auto-restauración: {e}")
+        log.error(f"❌ Error en auto-restauración desde Sheets: {e}")
         return {
             "status": "error",
-            "message": (
-                f"Error al restaurar desde Drive: {e}. "
-                "Ve a 👑 Admin → 💾 Backup para restaurar manualmente."
-            )
+            "message": f"Error al restaurar: {e}. Ve a 👑 Admin → 💾 Backup."
         }
 
 
@@ -7128,8 +7088,7 @@ def _run_extraction_local(uploaded_files, api_key, provider, model, max_tokens,
 
     # Auto-backup a Drive si está configurado y hubo extracciones exitosas
     if done > 0:
-        _backup_folder = (load_app_config("gdrive_backup_folder_id", "") or
-                          load_app_config("gdrive_backup_folder_url", ""))
+        _backup_folder = load_app_config("BACKUP_SHEET_URL", "")
         _auto_backup   = load_app_config("gdrive_auto_backup", "") == "1"
         if _backup_folder and _auto_backup:
             try:
@@ -8017,6 +7976,24 @@ def _page_settings(st, user_payload):
         if sheets_enabled:
             sheets_url = st.text_input("URL del Spreadsheet",
                                         value=_def_sheets_url, key="cfg_shurl", disabled=_ro)
+
+            # Mostrar el email de la cuenta de servicio para que el usuario sepa con quién compartir
+            _svc_hint = ""
+            try:
+                _raw_hint = load_app_config("gcp_credentials_json", "")
+                if not _raw_hint:
+                    import streamlit as _sthi
+                    if "gcp_service_account" in _sthi.secrets:
+                        import json as _jhi
+                        _raw_hint = _jhi.dumps(dict(_sthi.secrets["gcp_service_account"]))
+                if _raw_hint:
+                    _svc_hint = json.loads(_raw_hint).get("client_email", "")
+            except Exception:
+                pass
+            if _svc_hint:
+                st.info(f"📧 Comparte tu Sheets con esta cuenta como **Editor**: `{_svc_hint}`")
+            else:
+                st.caption("Guarda las credenciales JSON para ver el correo de la cuenta de servicio.")
 
             # ── Detectar fuente de credenciales activa ────────────────────
             _has_db      = False
@@ -9063,47 +9040,167 @@ def _page_admin(st, user_payload):
                 )
 
         with col_drive:
-            _has_gcp = bool(load_app_config("gcp_credentials_json",""))
-            _bk_url  = load_app_config("gdrive_backup_folder_url","")
-            if not _has_gcp:
-                st.warning("Configura las credenciales de Google primero.")
+            _has_bk_sheet = bool(load_app_config("BACKUP_SHEET_URL",""))
+            if not _has_bk_sheet:
+                st.warning("Configura primero la URL del Sheets de backup (abajo).")
             else:
-                if st.button("☁️ Subir a Drive ahora", key="btn_backup_drive",
-                             use_container_width=True,
-                             disabled=not _bk_url):
-                    with st.spinner("Subiendo a Drive..."):
+                if st.button("☁️ Guardar backup en Sheets", key="btn_backup_drive",
+                             use_container_width=True):
+                    with st.spinner("Guardando backup en Google Sheets..."):
                         _br = backup_to_drive()
                         if _br["ok"]:
-                            st.success(f"✅ {_br['filename']}")
+                            st.success(f"✅ {_br['message']}")
                             if _br["url"]:
-                                st.markdown(f"[Abrir en Drive]({_br['url']})")
+                                st.markdown(f"[Abrir Sheets de backup]({_br['url']})")
                         else:
                             st.error(_br["message"])
-                if not _bk_url:
-                    st.caption("Configura la carpeta de backup abajo primero.")
+
+        st.info(
+            "El backup usa un Google Sheets separado del de datos clinicos. "
+            "Las cuentas de servicio no pueden subir archivos a Drive (limitacion de Google), "
+            "pero si pueden escribir en Sheets. La app restaura automaticamente al reiniciar."
+        )
 
         st.markdown("---")
 
-        # ── Configuración de backup automático ───────────────────────────
-        st.markdown("**Backup automático en Google Drive**")
+        # ── URL del Sheets de backup ──────────────────────────────────────
+        st.markdown("**Google Sheets dedicado al backup**")
         st.caption(
-            "Cuando está activo, sube un backup ZIP a Drive automáticamente "
-            "cada vez que termina una extracción exitosa. "
-            "Guarda los últimos 7 backups y borra los más antiguos."
+            "Crea un Google Sheets nuevo (vacío), compártelo con la misma cuenta de servicio "
+            "que usas para los datos clínicos, y pega la URL aquí."
+        )
+        _bk_sheet_cur = load_app_config("BACKUP_SHEET_URL", "")
+        _bk_sheet_inp = st.text_input(
+            "URL del Sheets de backup",
+            value=_bk_sheet_cur,
+            placeholder="https://docs.google.com/spreadsheets/d/...",
+            key="cfg_bk_sheet_url",
+            help="Sheets separado del de datos. Solo se usara para guardar backups."
         )
 
-        _bk_url_cur  = load_app_config("gdrive_backup_folder_url","")
-        _auto_cur    = load_app_config("gdrive_auto_backup","") == "1"
+        # Mostrar email de cuenta de servicio
+        _svc_hint_bk = ""
+        try:
+            _raw_hint_bk = load_app_config("gcp_credentials_json", "")
+            if not _raw_hint_bk:
+                import streamlit as _sthi2
+                if "gcp_service_account" in _sthi2.secrets:
+                    import json as _jhi2
+                    _raw_hint_bk = _jhi2.dumps(dict(_sthi2.secrets["gcp_service_account"]))
+            if _raw_hint_bk:
+                _svc_hint_bk = json.loads(_raw_hint_bk).get("client_email", "")
+        except Exception:
+            pass
+        if _svc_hint_bk:
+            st.info(f"📧 Comparte tu Sheets de backup con esta cuenta como **Editor**: `{_svc_hint_bk}`")
+        else:
+            st.caption("Guarda las credenciales JSON (en Configuracion > Google Sheets) para ver el correo.")
 
-        _bk_url_inp = st.text_input(
-            "URL de la carpeta de Drive para backups",
-            value=_bk_url_cur,
-            placeholder="https://drive.google.com/drive/folders/...",
-            key="cfg_bk_folder",
-            help="Crea una carpeta en Drive llamada 'CEP_Backups' y pega su URL aquí."
-        )
+        # ── Validar conexión (igual que en Google Sheets de datos) ────────
+        if not _bk_sheet_inp.strip():
+            st.caption("Pega la URL del Sheets de backup para probar la conexion.")
+        elif st.button("🔌 Probar conexion de backup", key="btn_test_bk_sheets",
+                       type="primary"):
+            with st.spinner("Verificando..."):
+                _raw_creds = load_app_config("gcp_credentials_json", "")
+                if not _raw_creds:
+                    try:
+                        import streamlit as _st2
+                        _raw_creds = json.dumps(
+                            dict(_st2.secrets.get("gcp_service_account", {}))
+                        )
+                    except Exception:
+                        pass
+
+                if not _raw_creds:
+                    st.error("No hay credenciales guardadas. "
+                             "Configuralasen Configuracion > Google Sheets primero.")
+                else:
+                    try:
+                        _cred_data = json.loads(_raw_creds)
+                        _svc_email = _cred_data.get("client_email", "")
+                        _sheet_id  = GoogleSheetsManager._extract_sheet_id(
+                            _bk_sheet_inp.strip()
+                        )
+
+                        st.caption(f"Sheet ID: `{_sheet_id}`")
+                        st.caption(f"Cuenta de servicio: `{_svc_email}`")
+
+                        from google.oauth2.service_account import Credentials as _GC2
+                        from googleapiclient.discovery import build as _gb2
+                        _scopes2 = [
+                            "https://www.googleapis.com/auth/spreadsheets",
+                            "https://www.googleapis.com/auth/drive",
+                        ]
+                        _creds2 = _GC2.from_service_account_info(
+                            _cred_data, scopes=_scopes2
+                        )
+
+                        # Paso 1: compartir via Drive API
+                        st.caption("Paso 1/2: Otorgando permisos...")
+                        try:
+                            _drive2 = _gb2("drive", "v3", credentials=_creds2,
+                                           cache_discovery=False)
+                            _share2 = GoogleSheetsManager._auto_share_sheet(
+                                _drive2, _sheet_id, _svc_email
+                            )
+                            _ss2 = _share2.get("status")
+                            if _ss2 == "ya_compartido":
+                                st.info(f"Permisos: ya compartido con {_svc_email}")
+                            elif _ss2 == "compartido_ahora":
+                                st.success(f"Permiso otorgado a {_svc_email}")
+                            else:
+                                st.warning(
+                                    "No se pudo compartir automaticamente. "
+                                    "Comparte el Sheet manualmente con: "
+                                    + _svc_email + " (rol Editor)."
+                                )
+                        except Exception as _de2:
+                            st.warning(
+                                f"Drive API no disponible. "
+                                f"Comparte manualmente con `{_svc_email}` (rol Editor)."
+                            )
+
+                        # Paso 2: conectar y verificar
+                        st.caption("Paso 2/2: Conectando al spreadsheet de backup...")
+                        try:
+                            import gspread as _gsp2
+                            _gc2 = _gsp2.service_account_from_dict(_cred_data)
+                            _sp2 = _gc2.open_by_key(_sheet_id)
+                            st.success(
+                                f"Conectado a: **{_sp2.title}**   "
+                                f"({len(_sp2.worksheets())} hoja(s))"
+                            )
+                            # Guardar URL en DB
+                            save_app_config("BACKUP_SHEET_URL",
+                                            _bk_sheet_inp.strip(),
+                                            user_payload.get("sub","admin"))
+                            st.caption("URL guardada en DB. Ya puedes usar el backup.")
+                        except Exception as _oe2:
+                            _es2 = str(_oe2)
+                            if "404" in _es2 or "SpreadsheetNotFound" in _es2:
+                                st.error(
+                                    "El Sheet no esta compartido con la cuenta de servicio. "
+                                    f"Compartelo con `{_svc_email}` (rol Editor) y reintenta."
+                                )
+                            elif "403" in _es2:
+                                st.error(
+                                    f"Sin permiso. Asegurate de dar rol Editor "
+                                    f"(no solo Lector) a `{_svc_email}`."
+                                )
+                            else:
+                                st.error(f"Error al abrir el Sheet de backup: {_oe2}")
+
+                    except json.JSONDecodeError as _je2:
+                        st.error(f"JSON de credenciales invalido: {_je2}")
+                    except Exception as _ge2:
+                        st.error(f"Error inesperado: {_ge2}")
+
+        # ── Backup automático ─────────────────────────────────────────────
+        st.markdown("**Backup automático**")
+        _auto_cur = load_app_config("gdrive_auto_backup","") == "1"
         _auto_inp = st.checkbox(
-            "Activar backup automático después de cada extracción",
+            "Activar backup automático después de cada extracción exitosa",
             value=_auto_cur,
             key="cfg_bk_auto"
         )
@@ -9112,19 +9209,14 @@ def _page_admin(st, user_payload):
                      type="primary"):
             try:
                 _uid = user_payload.get("sub","admin")
-                save_app_config("gdrive_backup_folder_url",
-                                _bk_url_inp.strip(), updated_by=_uid)
-                save_app_config("gdrive_backup_folder_id",
-                                GoogleDriveManager._extract_folder_id(_bk_url_inp.strip()),
-                                updated_by=_uid)
+                if _bk_sheet_inp.strip():
+                    save_app_config("BACKUP_SHEET_URL",
+                                    _bk_sheet_inp.strip(), updated_by=_uid)
                 save_app_config("gdrive_auto_backup",
                                 "1" if _auto_inp else "0", updated_by=_uid)
                 st.success("✅ Configuración de backup guardada.")
-                if _auto_inp:
-                    st.info(
-                        "Backup automático activo. Se subirá a Drive después de "
-                        "cada extracción exitosa. Los últimos 7 backups se conservan."
-                    )
+                if _auto_inp and not _bk_sheet_inp.strip():
+                    st.warning("El backup automático está activo pero falta la URL del Sheets.")
             except Exception as _e:
                 st.error(f"❌ {_e}")
 
